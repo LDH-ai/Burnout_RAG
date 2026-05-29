@@ -1,0 +1,21 @@
+# 마음 회복 RAG 챗봇 — 앱 실행/배포용 의존성
+# Streamlit Cloud 가 이 파일을 보고 그대로 설치한다.
+
+streamlit>=1.40
+
+# LangChain 1.x 계열
+langchain>=1.0
+langchain-core>=1.0
+langchain-community>=0.4
+langchain-classic>=1.0
+langchain-openai>=1.0
+langchain-text-splitters>=1.0
+
+# 벡터DB / 검색
+faiss-cpu>=1.8
+rank-bm25>=0.2.2                 # BM25 희소 검색
+kiwipiepy>=0.18                  # 한국어 형태소 분석 (BM25 전처리)
+
+# 환경/모델
+python-dotenv>=1.0
+openai>=1.0

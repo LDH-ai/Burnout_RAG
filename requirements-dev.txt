@@ -1,0 +1,10 @@
+# RAGAS 평가 전용 추가 의존성 (배포에는 불필요, 로컬 평가 시에만)
+#   설치:  pip install -r requirements-dev.txt
+#   (requirements.txt 를 먼저 포함해 앱 의존성까지 함께 설치)
+
+-r requirements.txt
+
+ragas>=0.2
+datasets>=2.0
+pandas>=2.0
+matplotlib>=3.7
