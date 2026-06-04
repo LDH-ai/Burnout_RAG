@@ -152,6 +152,7 @@ class MindCareRAGPipeline:
             if hasattr(self, key):
                 setattr(self, key, value)
 
+        load_dotenv(".env")
         load_dotenv(self.ENV_PATH)
 
         self.embeddings = OpenAIEmbeddings(model=self.EMBEDDING_MODEL)
@@ -180,11 +181,16 @@ class MindCareRAGPipeline:
     # ===================================================================
     def _load_temp_history(self) -> None:
         if os.path.exists(self.TEMP_HISTORY_PATH):
-            with open(self.TEMP_HISTORY_PATH, "r", encoding="utf-8") as f:
-                self._temp_history = json.load(f)
+            try:
+                with open(self.TEMP_HISTORY_PATH, "r", encoding="utf-8") as f:
+                    self._temp_history = json.load(f)
+            except (json.JSONDecodeError, OSError):
+                self._temp_history = {}
 
     def _save_temp_history(self) -> None:
-        os.makedirs(os.path.dirname(self.TEMP_HISTORY_PATH), exist_ok=True)
+        directory = os.path.dirname(self.TEMP_HISTORY_PATH)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
         with open(self.TEMP_HISTORY_PATH, "w", encoding="utf-8") as f:
             json.dump(self._temp_history, f, ensure_ascii=False, indent=2)
 
@@ -309,18 +315,23 @@ class MindCareRAGPipeline:
     # 검색 — BM25(Kiwi) + FAISS 앙상블 (Hybrid)
     # ===================================================================
     def build_retriever(self, vectorstore: FAISS) -> Runnable:
-        EnsembleRetriever = _import_ensemble_retriever()
-
-        corpus = self._get_corpus_documents()
-        bm25   = BM25Retriever.from_documents(corpus, preprocess_func=make_kiwi_tokenizer())
-        bm25.k = self.TOP_K
-
         faiss_retriever = vectorstore.as_retriever(search_kwargs={"k": self.TOP_K})
 
-        return EnsembleRetriever(
-            retrievers=[bm25, faiss_retriever],
-            weights=[self.BM25_WEIGHT, self.FAISS_WEIGHT],
-        )
+        try:
+            EnsembleRetriever = _import_ensemble_retriever()
+            corpus = self._get_corpus_documents()
+            bm25 = BM25Retriever.from_documents(corpus, preprocess_func=make_kiwi_tokenizer())
+            bm25.k = self.TOP_K
+
+            return EnsembleRetriever(
+                retrievers=[bm25, faiss_retriever],
+                weights=[self.BM25_WEIGHT, self.FAISS_WEIGHT],
+            )
+        except Exception as e:
+            # rank_bm25, kiwipiepy, langchain-classic 등이 빠진 환경에서도 앱이 완전히 죽지 않도록
+            # FAISS 단독 검색으로 폴백합니다. 발표/가점용 앙상블을 쓰려면 requirements를 설치하세요.
+            warnings.warn(f"BM25 앙상블 검색을 만들지 못해 FAISS 검색만 사용합니다: {e}")
+            return faiss_retriever
 
     # ===================================================================
     # 위험도 분류 — 키워드 게이트 + 러닝 온도 + 연속 누적

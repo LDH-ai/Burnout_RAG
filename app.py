@@ -1,15 +1,33 @@
-"""app.py — 마음 회복 RAG 챗봇 (Streamlit)
+"""app.py — 번아웃 예방 및 관리 RAG 챗봇 UI 개선본
 
-흐름
-  1) 신규 이용자 온보딩 설문(6문항) → 위험군 판별 → 초기 마음 온도 설정
-  2) 채팅: 위험군에 따라 답변 톤이 분기되고, 마음 온도는 대화로만 자동 조정된다.
-  3) 마음 온도는 우상단 배지 + 사이드바 세로 온도계로 표시(읽기 전용)
+핵심 흐름
+  1) 온보딩 설문 6문항으로 초기 마음 온도 계산
+  2) 채팅 단계에서 RAG 답변 생성
+  3) 마음 온도, 위험도, 체크인 점수를 대시보드 형태로 표시
 """
 
 from __future__ import annotations
+
 import os
 import uuid
+from pathlib import Path
+from typing import Any
+
 import streamlit as st
+from dotenv import load_dotenv
+
+st.set_page_config(
+    page_title="마음온도 RAG",
+    page_icon="🌱",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# -----------------------------------------------------------------------------
+# 환경 변수 로딩
+# -----------------------------------------------------------------------------
+load_dotenv(".env")
+load_dotenv("./data/.env")
 
 if "OPENAI_API_KEY" not in os.environ:
     try:
@@ -18,766 +36,723 @@ if "OPENAI_API_KEY" not in os.environ:
     except Exception:
         pass
 
-from base import (
+if not os.environ.get("OPENAI_API_KEY"):
+    st.error("🔑 OPENAI_API_KEY가 설정되지 않았습니다.")
+    st.info(
+        "로컬 실행: 프로젝트 폴더의 `.env` 또는 `data/.env`에 `OPENAI_API_KEY=키값`을 넣어주세요.\n\n"
+        "Streamlit Cloud: Settings → Secrets에 `OPENAI_API_KEY`를 추가하세요."
+    )
+    st.stop()
+
+from base import (  # noqa: E402
+    CRISIS_LINE_MENTAL,
+    CRISIS_LINE_SUICIDE,
+    RISK_HIGH,
+    RISK_MID,
     MindCareRAGPipeline,
-    RISK_HIGH, RISK_MID,
-    CRISIS_LINE_SUICIDE, CRISIS_LINE_MENTAL,
 )
 
-st.set_page_config(
-    page_title="🌱 번아웃 예방 및 관리 RAG",
-    page_icon="🌱",
-    layout="centered",
-)
+# -----------------------------------------------------------------------------
+# 세션 상태
+# -----------------------------------------------------------------------------
+def init_state() -> None:
+    defaults: dict[str, Any] = {
+        "session_id": f"user-{uuid.uuid4().hex[:8]}",
+        "stage": "onboarding",
+        "survey_step": 0,
+        "answers": {},
+        "messages": [],
+        "mind_temp": MindCareRAGPipeline.DEFAULT_TEMP,
+        "risk_level": "low",
+        "pending_message": None,
+        "show_debug": False,
+    }
+    for key, value in defaults.items():
+        st.session_state.setdefault(key, value)
 
-# ── Session state 초기화 (theme 포함 — CSS 주입 전에 먼저) ─────────────────────
-if "session_id"      not in st.session_state: st.session_state.session_id      = f"user-{uuid.uuid4().hex[:8]}"
-if "stage"           not in st.session_state: st.session_state.stage           = "onboarding"
-if "survey_step"     not in st.session_state: st.session_state.survey_step     = 0
-if "answers"         not in st.session_state: st.session_state.answers         = {}
-if "messages"        not in st.session_state: st.session_state.messages        = []
-if "mind_temp"       not in st.session_state: st.session_state.mind_temp       = MindCareRAGPipeline.DEFAULT_TEMP
-if "risk_level"      not in st.session_state: st.session_state.risk_level      = "low"
-if "pending_message" not in st.session_state: st.session_state.pending_message = None
-if "theme"           not in st.session_state: st.session_state.theme           = st.query_params.get("theme", "light")
+    if "theme" not in st.session_state:
+        param = st.query_params.get("theme", "light")
+        if isinstance(param, list):
+            param = param[0] if param else "light"
+        st.session_state.theme = param if param in ("light", "dark") else "light"
 
-# ── Design tokens ──────────────────────────────────────────────────────────────
-_is_dark = (st.session_state.theme == "dark")
 
-if _is_dark:
-    C_BG           = "#1C1815"
-    C_BG_GRAD      = "linear-gradient(160deg,#1C1815 0%,#231E18 100%)"
-    C_CARD         = "#272017"
-    C_CARD_AI      = "#272017"
-    C_CARD_USER    = "#1A2E1D"
-    C_USER_BORDER  = "#2C4A32"
-    C_SIDEBAR      = "#1E1A14"
-    C_TEXT         = "#EDE5D8"
-    C_SUBTEXT      = "#9A8878"
-    C_BORDER       = "#3A322A"
-    C_INPUT        = "#2A2218"
-    C_BOTTOM_GLASS = "rgba(28,24,21,0.94)"
-    C_BOTTOM_BORDER= "rgba(58,50,42,0.8)"
-    C_ALERT_BG     = "#3A1A15"
-    C_HERO_GRAD_H  = "#3A1A15"
-    C_HERO_GRAD_M  = "#2A2A10"
-    C_HERO_GRAD_L  = "#1A2E1D"
+init_state()
+
+IS_DARK = st.session_state.theme == "dark"
+
+# -----------------------------------------------------------------------------
+# 디자인 토큰
+# -----------------------------------------------------------------------------
+if IS_DARK:
+    BG = "#141714"
+    BG_SOFT = "#1D211D"
+    CARD = "#222820"
+    CARD_2 = "#1B201B"
+    TEXT = "#F0F3EC"
+    MUTED = "#A7B0A3"
+    BORDER = "rgba(255,255,255,.11)"
+    INPUT = "#202620"
+    SHADOW = "0 18px 60px rgba(0,0,0,.32)"
+    GRADIENT = "radial-gradient(circle at top left, rgba(126,200,160,.20), transparent 35%), linear-gradient(135deg, #141714 0%, #20271E 100%)"
+    BOTTOM_BG = "rgba(20,23,20,.94)"
+    BOTTOM_CARD = "#1B201B"
 else:
-    C_BG           = "#FAF7F2"
-    C_BG_GRAD      = "linear-gradient(160deg,#FAF7F2 0%,#F4EDE3 100%)"
-    C_CARD         = "#FFFFFF"
-    C_CARD_AI      = "#FFFFFF"
-    C_CARD_USER    = "#EDF8EE"
-    C_USER_BORDER  = "#C8E8CC"
-    C_SIDEBAR      = "#F5F1EA"
-    C_TEXT         = "#3A3330"
-    C_SUBTEXT      = "#9A8878"
-    C_BORDER       = "#E5DDD4"
-    C_INPUT        = "#FFFFFF"
-    C_BOTTOM_GLASS = "rgba(250,247,242,0.92)"
-    C_BOTTOM_BORDER= "rgba(229,221,212,0.7)"
-    C_ALERT_BG     = "#FFF0EE"
-    C_HERO_GRAD_H  = "#FEE4DC"
-    C_HERO_GRAD_M  = "#FFFBE6"
-    C_HERO_GRAD_L  = "#EDF8EE"
+    BG = "#F7F4EC"
+    BG_SOFT = "#EFE9DC"
+    CARD = "#FFFFFF"
+    CARD_2 = "#FBF8F1"
+    TEXT = "#2F332D"
+    MUTED = "#7F887A"
+    BORDER = "rgba(65,78,55,.13)"
+    INPUT = "#FFFFFF"
+    SHADOW = "0 18px 55px rgba(89,94,72,.14)"
+    GRADIENT = "radial-gradient(circle at top left, rgba(126,200,160,.30), transparent 33%), linear-gradient(135deg, #F7F4EC 0%, #ECF4E9 100%)"
+    BOTTOM_BG = "rgba(247,244,236,.82)"
+    BOTTOM_CARD = "#FFFFFF"
 
-# 공통 accent — 라이트/다크 동일
-C_PRIMARY = "#6EA97A"   # sage green
-C_ACCENT  = "#E78A74"   # warm coral
-C_BLUE    = "#7AA6D6"   # secondary blue
-C_MINT    = "#7CC8A0"
-C_YELLOW  = "#F5C842"
-C_CORAL   = "#E78A74"
+PRIMARY = "#70A77B"
+MINT = "#7CC8A0"
+YELLOW = "#F3C54B"
+CORAL = "#E68070"
+BLUE = "#79A7D8"
 
 
-def _toggle_theme() -> None:
-    """세션 유지 + URL 파라미터 동기화 테마 전환 (페이지 재로드 없음)."""
-    new_theme = "dark" if st.session_state.theme == "light" else "light"
-    st.session_state.theme = new_theme
-    st.query_params["theme"] = new_theme
-    st.rerun()
+def color_for_temp(temp: float) -> tuple[str, str, str]:
+    if temp >= MindCareRAGPipeline.THRESHOLD_MID:
+        return MINT, "안정", "☀️"
+    if temp >= MindCareRAGPipeline.THRESHOLD_HIGH:
+        return YELLOW, "주의", "🌤️"
+    return CORAL, "위험", "🌧️"
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 전역 CSS — Pretendard 폰트 + 레이아웃 + 컴포넌트
-# ══════════════════════════════════════════════════════════════════════════════
-st.markdown(f"""
-<!-- Pretendard 웹폰트 (한국어 UX 품질 개선) -->
-<link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
-<link rel="stylesheet"
-      href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.min.css">
+def risk_label(risk: str) -> tuple[str, str]:
+    if risk == RISK_HIGH:
+        return CORAL, "많이 지쳐 보여요"
+    if risk == RISK_MID:
+        return YELLOW, "조금 지쳐 보여요"
+    return PRIMARY, "안정적이에요"
 
+
+# -----------------------------------------------------------------------------
+# CSS
+# -----------------------------------------------------------------------------
+# 주의: 아래 CSS는 반드시 <style>...</style> 안에 있어야 화면에 코드가 노출되지 않습니다.
+st.markdown(
+    f"""
 <style>
-/* ══ 0. 폰트 & html/body 배경 (검정 하단 근본 fix) ══════════════════ */
-html, body {{
-    background: {C_BG} !important;
-    background-color: {C_BG} !important;
-    font-family: 'Pretendard', -apple-system, BlinkMacSystemFont,
-                 'Apple SD Gothic Neo', 'Noto Sans KR', 'Segoe UI',
-                 'Apple Color Emoji', 'Segoe UI Emoji', 'Noto Color Emoji',
-                 sans-serif !important;
+@import url('https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.min.css');
+* {{ box-sizing: border-box; }}
+html, body, .stApp {{ background: {GRADIENT} !important; color: {TEXT} !important; font-family: 'Pretendard', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif !important; }}
+body, p, div, span, button, input, textarea, label, h1, h2, h3, h4, h5, h6, li {{ font-family: 'Pretendard', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif !important; }}
+/* Streamlit 채팅 아바타는 Material Symbols 폰트의 ligature를 쓰기 때문에, 전역 폰트가 덮어쓰면 smart_toy 같은 글자가 노출됨 */
+.material-icons, .material-icons-outlined, .material-icons-round, .material-icons-sharp,
+.material-symbols-outlined, .material-symbols-rounded, .material-symbols-sharp,
+[data-testid="stChatMessageAvatarAssistant"] span,
+[data-testid="stChatMessageAvatarUser"] span,
+[data-testid="chatAvatarIcon-assistant"],
+[data-testid="chatAvatarIcon-user"] {{
+    font-family: 'Material Symbols Rounded', 'Material Icons' !important;
+    font-weight: normal !important;
+    font-style: normal !important;
+    line-height: 1 !important;
+    text-transform: none !important;
+    letter-spacing: normal !important;
+    white-space: nowrap !important;
+    word-wrap: normal !important;
+    direction: ltr !important;
+    -webkit-font-feature-settings: 'liga' !important;
+    -webkit-font-smoothing: antialiased !important;
 }}
-/* 이모지·아이콘 요소는 제외하고 텍스트 요소에만 폰트 적용 */
-p, span, div, li, button, input, textarea, label, h1, h2, h3, h4, h5, h6, a {{
-    font-family: 'Pretendard', -apple-system, BlinkMacSystemFont,
-                 'Apple SD Gothic Neo', 'Noto Sans KR', 'Segoe UI',
-                 'Apple Color Emoji', 'Segoe UI Emoji', 'Noto Color Emoji',
-                 sans-serif !important;
-    box-sizing: border-box;
-}}
+[data-testid="stAppViewContainer"] {{ background: transparent !important; }}
+.main .block-container {{ max-width: 1180px !important; padding-top: 1.5rem !important; padding-bottom: 6.5rem !important; }}
 
-/* ══ 1. 앱 전체 배경 ════════════════════════════════════════════════ */
-.stApp {{
-    background: {C_BG_GRAD} !important;
-    color: {C_TEXT} !important;
-    transition: background .4s ease, color .3s ease;
-}}
-.main .block-container {{
-    max-width: 760px !important;
-    padding-top: 1.4rem !important;
-    padding-bottom: 6rem !important;   /* 입력창에 가리지 않도록 */
-}}
+h1, h2, h3, h4, h5, h6, p, li, span, label {{ color: {TEXT} !important; }}
+[data-testid="stCaptionContainer"] p, .muted {{ color: {MUTED} !important; }}
 
-/* ══ 2. 전역 텍스트 ══════════════════════════════════════════════════ */
-.stApp p, .stApp span, .stApp li,
-.stMarkdown, .stMarkdown p, .stMarkdown li, .stMarkdown span,
-[data-testid="stText"], [data-testid="stMarkdownContainer"] p {{
-    color: {C_TEXT} !important;
-    line-height: 1.75 !important;
-}}
-.stCaption p, [data-testid="stCaptionContainer"] p {{
-    color: {C_SUBTEXT} !important;
-    font-size: 0.78rem !important;
-}}
-h1, h2, h3, h4, h5 {{
-    color: {C_TEXT} !important;
-    letter-spacing: -0.02em;
-}}
+/* sidebar */
+section[data-testid="stSidebar"] {{ background: {CARD_2} !important; border-right: 1px solid {BORDER} !important; }}
+section[data-testid="stSidebar"] [data-testid="stVerticalBlock"] {{ gap: .55rem !important; }}
 
-/* ══ 3. 사이드바 ═════════════════════════════════════════════════════ */
-section[data-testid="stSidebar"] {{
-    background: {C_SIDEBAR} !important;
-    border-right: 1px solid {C_BORDER} !important;
-    transition: background .4s ease;
+/* buttons */
+.stButton > button {{
+    border-radius: 16px !important;
+    border: 1px solid {BORDER} !important;
+    background: {CARD} !important;
+    color: {TEXT} !important;
+    min-height: 42px !important;
+    font-weight: 650 !important;
+    box-shadow: 0 8px 22px rgba(0,0,0,.04) !important;
+    transition: all .18s ease !important;
 }}
-section[data-testid="stSidebar"] p,
-section[data-testid="stSidebar"] span,
-section[data-testid="stSidebar"] li,
-section[data-testid="stSidebar"] .stMarkdown p {{
-    color: {C_TEXT} !important;
-}}
-section[data-testid="stSidebar"] .stCaption p,
-section[data-testid="stSidebar"] [data-testid="stCaptionContainer"] p {{
-    color: {C_SUBTEXT} !important;
-}}
-
-/* ══ 4. 채팅 버블 ════════════════════════════════════════════════════ */
-/* 기본값 = 사용자 스타일 (:has 미지원 환경 폴백) */
-[data-testid="stChatMessage"] {{
-    background: {C_CARD_USER} !important;
-    border: 1px solid {C_USER_BORDER} !important;
-    border-radius: 22px !important;
-    margin-bottom: 12px !important;
-    padding: 4px 0 !important;
-    box-shadow: 0 2px 10px rgba(0,0,0,.05) !important;
-    transition: box-shadow .2s ease, transform .2s ease;
-    animation: bubbleIn .4s cubic-bezier(.22,.68,0,1.15) both;
-}}
-[data-testid="stChatMessage"]:hover {{
-    box-shadow: 0 4px 18px rgba(0,0,0,.09) !important;
+.stButton > button:hover {{
+    border-color: {PRIMARY} !important;
+    color: {PRIMARY} !important;
     transform: translateY(-1px);
+    box-shadow: 0 12px 28px rgba(112,167,123,.20) !important;
 }}
-/* AI 버블 오버라이드 */
-[data-testid="stChatMessage"]:has([data-testid="chatAvatarIcon-assistant"]) {{
-    background: {C_CARD_AI} !important;
-    border-color: {C_BORDER} !important;
-    box-shadow: 0 2px 14px rgba(0,0,0,.06) !important;
-}}
-/* 사용자 버블 명시 (지원 환경) */
-[data-testid="stChatMessage"]:has([data-testid="chatAvatarIcon-user"]) {{
-    background: {C_CARD_USER} !important;
-    border-color: {C_USER_BORDER} !important;
-}}
-/* 버블 내 텍스트 */
-[data-testid="stChatMessage"] p,
-[data-testid="stChatMessage"] li,
-[data-testid="stChatMessage"] span,
-[data-testid="stChatMessage"] .stMarkdown p,
-[data-testid="stChatMessage"] [data-testid="stMarkdownContainer"] p {{
-    color: {C_TEXT} !important;
-    line-height: 1.8 !important;
-}}
-
-/* ══ 5. 사용자 아바타 (빨간색 제거) ══════════════════════════════════ */
-[data-testid="chatAvatarIcon-user"],
-[data-testid="stChatMessageAvatarUser"] {{
-    background: linear-gradient(135deg, {C_BLUE}, {C_PRIMARY}) !important;
+.stButton > button[kind="primary"] {{
+    background: linear-gradient(135deg, {PRIMARY}, {MINT}) !important;
     color: white !important;
-    box-shadow: 0 2px 8px {C_BLUE}44 !important;
-}}
-[data-testid="chatAvatarIcon-user"] svg path,
-[data-testid="stChatMessageAvatarUser"] svg path {{
-    fill: white !important;
+    border: none !important;
 }}
 
-/* ══ 6. 하단 입력 영역 — Glassmorphism (검정 배경 근본 제거) ══════════ */
-/* 다중 선택자로 버전 변경에 내성 강화 */
+/* chat */
+[data-testid="stChatMessage"] {{
+    border-radius: 22px !important;
+    border: 1px solid {BORDER} !important;
+    background: {CARD} !important;
+    box-shadow: 0 8px 28px rgba(0,0,0,.055) !important;
+    margin-bottom: 14px !important;
+}}
+[data-testid="stChatMessage"]:has([data-testid="chatAvatarIcon-user"]) {{
+    background: linear-gradient(135deg, rgba(112,167,123,.18), rgba(124,200,160,.10)) !important;
+}}
+[data-testid="stChatMessage"] p {{ line-height: 1.78 !important; }}
+
+/* chat input */
 [data-testid="stBottom"],
 [data-testid="stBottomBlockContainer"],
 [data-testid="stBottom"] > div,
-[data-testid="stBottomBlockContainer"] > div,
-div[class*="bottom"],
-div[class*="Bottom"] {{
-    background: {C_BOTTOM_GLASS} !important;
-    backdrop-filter: blur(20px) saturate(180%) !important;
-    -webkit-backdrop-filter: blur(20px) saturate(180%) !important;
-    border-top: 1px solid {C_BOTTOM_BORDER} !important;
-    box-shadow: 0 -4px 24px rgba(0,0,0,.06) !important;
+[data-testid="stBottomBlockContainer"] > div {{
+    background: {BOTTOM_BG} !important;
+    background-color: {BOTTOM_BG} !important;
+    backdrop-filter: blur(18px) saturate(160%) !important;
+    -webkit-backdrop-filter: blur(18px) saturate(160%) !important;
+    border-top: 1px solid {BORDER} !important;
+    box-shadow: 0 -10px 34px rgba(0,0,0,.18) !important;
 }}
-[data-testid="stBottom"]::before,
-[data-testid="stBottomBlockContainer"]::before {{
-    background: linear-gradient(to top, {C_BG} 40%, transparent) !important;
-}}
-/* 입력창 컨테이너 */
 [data-testid="stChatInput"],
+[data-testid="stChatInput"] > div,
+[data-testid="stChatInput"] > div > div,
 [data-testid="stChatInputContainer"],
-div[class*="ChatInput"] {{
+div[class*="stChatInput"] {{
     background: transparent !important;
+    background-color: transparent !important;
 }}
 [data-testid="stChatInput"] textarea {{
-    border-radius: 28px !important;
-    background: {C_INPUT} !important;
-    border: 1.5px solid {C_BORDER} !important;
-    color: {C_TEXT} !important;
-    font-size: 0.95rem !important;
-    padding: 12px 20px !important;
-    box-shadow: 0 2px 12px rgba(0,0,0,.06) !important;
-    transition: border-color .2s, box-shadow .2s;
-}}
-[data-testid="stChatInput"] textarea::placeholder {{ color: {C_SUBTEXT} !important; }}
-[data-testid="stChatInput"] textarea:focus {{
-    border-color: {C_PRIMARY} !important;
-    box-shadow: 0 0 0 3px {C_PRIMARY}30, 0 2px 12px rgba(0,0,0,.08) !important;
-    outline: none !important;
-}}
-
-/* ══ 7. 버튼 ═════════════════════════════════════════════════════════ */
-.stButton > button {{
-    border-radius: 14px !important;
-    border: 1.5px solid {C_BORDER} !important;
-    background: {C_CARD} !important;
-    color: {C_TEXT} !important;
-    font-size: 0.9rem !important;
-    font-weight: 500 !important;
-    letter-spacing: -0.01em !important;
-    white-space: normal !important;
-    height: auto !important;
-    padding: 9px 16px !important;
-    transition: all .2s cubic-bezier(.22,.68,0,1.2) !important;
-}}
-.stButton > button:hover {{
-    border-color: {C_PRIMARY} !important;
-    color: {C_PRIMARY} !important;
-    background: {C_PRIMARY}0C !important;
-    box-shadow: 0 4px 14px {C_PRIMARY}28 !important;
-    transform: translateY(-1px) !important;
-}}
-.stButton > button:active {{ transform: translateY(0) scale(.98) !important; }}
-.stButton > button[kind="primary"] {{
-    background: linear-gradient(135deg, {C_PRIMARY} 0%, {C_PRIMARY}CC 100%) !important;
-    color: white !important;
-    border-color: transparent !important;
-    font-weight: 600 !important;
-    box-shadow: 0 4px 16px {C_PRIMARY}44 !important;
-    letter-spacing: .01em !important;
-}}
-.stButton > button[kind="primary"]:hover {{
-    transform: translateY(-2px) !important;
-    box-shadow: 0 8px 24px {C_PRIMARY}55 !important;
-    color: white !important;
-}}
-
-/* ══ 8. Progress bar ══════════════════════════════════════════════════ */
-[data-testid="stProgressBar"] > div {{
-    background: {C_BORDER} !important;
+    background: {INPUT} !important;
+    color: {TEXT} !important;
+    border: 1px solid {BORDER} !important;
     border-radius: 999px !important;
-    overflow: hidden;
-    height: 6px !important;
+    min-height: 48px !important;
+    box-shadow: none !important;
 }}
-[data-testid="stProgressBar"] > div > div {{
-    background: linear-gradient(90deg, {C_PRIMARY}, {C_MINT}) !important;
-    border-radius: 999px !important;
-    transition: width .6s cubic-bezier(.22,.68,0,1);
-}}
-[data-testid="stProgressBar"] p {{ color: {C_SUBTEXT} !important; font-size: 0.78rem !important; }}
-
-/* ══ 9. 구분선 ════════════════════════════════════════════════════════ */
-hr {{ border-color: {C_BORDER} !important; opacity: .5; margin: 1rem 0 !important; }}
-
-/* ══ 10. Spinner ══════════════════════════════════════════════════════ */
-[data-testid="stSpinner"] p {{ color: {C_SUBTEXT} !important; }}
-
-/* ══ 11. 애니메이션 ══════════════════════════════════════════════════ */
-@keyframes bubbleIn {{
-    from {{ opacity: 0; transform: translateY(12px) scale(.97); }}
-    to   {{ opacity: 1; transform: translateY(0)   scale(1);    }}
-}}
-@keyframes fadeSlide {{
-    from {{ opacity: 0; transform: translateY(8px); }}
-    to   {{ opacity: 1; transform: translateY(0);   }}
-}}
-@keyframes fadeIn {{
-    from {{ opacity: 0; }}
-    to   {{ opacity: 1; }}
-}}
-@keyframes scaleIn {{
-    from {{ opacity: 0; transform: scale(.95); }}
-    to   {{ opacity: 1; transform: scale(1);   }}
+[data-testid="stChatInput"] textarea::placeholder {{ color: {MUTED} !important; }}
+[data-testid="stChatInput"] button {{
+    background: {BOTTOM_CARD} !important;
+    color: {TEXT} !important;
+    border-radius: 50% !important;
 }}
 
-footer, #MainMenu, header {{ visibility: hidden; }}
+/* streamlit progress */
+[data-testid="stProgress"] > div > div > div > div {{ background: linear-gradient(90deg, {PRIMARY}, {MINT}) !important; }}
+hr {{ border-color: {BORDER} !important; opacity: .55; }}
+footer, #MainMenu {{ visibility: hidden; }}
+header {{ visibility: hidden; height: 0 !important; }}
+[data-testid="collapsedControl"] {{ visibility: visible !important; display: block !important; }}
+
+.app-shell {{ animation: fadeUp .38s ease both; }}
+.hero {{
+    background: {CARD}; border: 1px solid {BORDER}; border-radius: 30px;
+    box-shadow: {SHADOW}; padding: 28px; margin-bottom: 18px;
+    position: relative; overflow: hidden;
+}}
+.hero::after {{
+    content: ''; position: absolute; right: -80px; top: -90px; width: 250px; height: 250px;
+    border-radius: 50%; background: rgba(112,167,123,.18);
+}}
+.hero-eyebrow {{ color: {PRIMARY} !important; font-size: 13px; font-weight: 800; letter-spacing: .08em; margin-bottom: 8px; }}
+.hero-title {{ font-size: 34px; font-weight: 900; letter-spacing: -.055em; line-height: 1.16; margin: 0 0 10px; }}
+.hero-sub {{ color: {MUTED} !important; font-size: 15px; line-height: 1.7; max-width: 620px; margin: 0; }}
+
+.soft-card {{
+    background: {CARD}; border: 1px solid {BORDER}; border-radius: 24px;
+    padding: 18px; box-shadow: 0 10px 32px rgba(0,0,0,.055); margin-bottom: 14px;
+}}
+.pill {{
+    display: inline-flex; align-items: center; gap: 7px; padding: 7px 13px;
+    border-radius: 999px; font-size: 12px; font-weight: 800; border: 1px solid {BORDER};
+    background: {CARD_2}; color: {TEXT};
+}}
+.metric-grid {{ display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin: 16px 0 8px; }}
+.metric-card {{ background: {CARD_2}; border: 1px solid {BORDER}; border-radius: 20px; padding: 15px; }}
+.metric-label {{ color: {MUTED} !important; font-size: 12px; font-weight: 700; margin-bottom: 8px; }}
+.metric-value {{ font-size: 24px; font-weight: 900; letter-spacing: -.03em; }}
+.temp-ring {{
+    width: 132px; height: 132px; border-radius: 50%; display: grid; place-items: center;
+    background: conic-gradient(var(--ring-color) calc(var(--temp) * 1%), rgba(127,136,122,.18) 0);
+    box-shadow: inset 0 0 0 12px {CARD_2}, 0 10px 30px rgba(0,0,0,.08);
+}}
+.temp-ring-inner {{
+    width: 96px; height: 96px; border-radius: 50%; background: {CARD}; display: grid; place-items: center;
+    border: 1px solid {BORDER};
+}}
+.temp-number {{ font-size: 27px; font-weight: 950; line-height: 1; }}
+.temp-text {{ color: {MUTED} !important; font-size: 11px; font-weight: 800; margin-top: 4px; }}
+.check-row {{ margin: 10px 0; }}
+.check-top {{ display:flex; justify-content:space-between; font-size:12px; font-weight:750; margin-bottom:6px; }}
+.check-bar {{ height: 8px; border-radius: 999px; background: rgba(127,136,122,.18); overflow: hidden; }}
+.check-fill {{ height: 100%; border-radius: 999px; background: linear-gradient(90deg, {PRIMARY}, {MINT}); }}
+.tip-box {{ background: rgba(112,167,123,.12); border: 1px solid rgba(112,167,123,.28); border-radius: 18px; padding: 14px; }}
+.suggest-title {{ color: {MUTED} !important; font-size: 13px; font-weight: 800; margin: 18px 0 10px; }}
+@keyframes fadeUp {{ from {{ opacity:0; transform: translateY(10px); }} to {{ opacity:1; transform: translateY(0); }} }}
+@media (max-width: 800px) {{
+    .hero-title {{ font-size: 27px; }}
+    .metric-grid {{ grid-template-columns: 1fr; }}
+}}
+
+
+/* v5 fixes: prevent chat input clipping and remove white containers in dark mode */
+[data-testid="stBottom"] *,
+[data-testid="stBottomBlockContainer"] *,
+[data-testid="stChatInput"] *,
+[data-testid="stChatInputContainer"] * {{
+    box-shadow: none !important;
+}}
+[data-testid="stChatInput"] [data-baseweb="textarea"],
+[data-testid="stChatInput"] [data-baseweb="base-input"],
+[data-testid="stChatInput"] div {{
+    background: transparent !important;
+    background-color: transparent !important;
+}}
+[data-testid="stChatInput"] textarea {{
+    min-height: 54px !important;
+    height: 54px !important;
+    padding: 15px 18px !important;
+    line-height: 1.35 !important;
+    overflow-y: hidden !important;
+}}
+[data-testid="stChatInput"] > div {{
+    border-radius: 24px !important;
+    background: transparent !important;
+}}
+[data-testid="stBottom"] button,
+[data-testid="stBottomBlockContainer"] button {{
+    background: {BOTTOM_CARD} !important;
+    color: {TEXT} !important;
+}}
+[data-testid="stBottom"] svg,
+[data-testid="stBottomBlockContainer"] svg {{
+    color: {TEXT} !important;
+}}
 </style>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
 
-
-# ── 온보딩 설문 정의 ───────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
+# 설문/추천 질문
+# -----------------------------------------------------------------------------
 SURVEY = [
-    ("sleep",    "🌙", "요즘 잠은 잘 주무시나요?",        True,  ["거의 못 잠", "뒤척임", "보통", "잘 잠", "아주 푹 잠"]),
-    ("energy",   "⚡", "하루 동안 에너지는 어떤가요?",     True,  ["바닥남", "많이 없음", "보통", "괜찮음", "활기참"]),
-    ("recovery", "🌿", "쉬고 나면 회복이 잘 되시나요?",    True,  ["전혀", "조금", "보통", "잘 됨", "충분히"]),
-    ("mood",     "😊", "전반적인 기분은 어떠세요?",        True,  ["매우 가라앉음", "우울함", "보통", "좋음", "아주 좋음"]),
-    ("stress",   "🔥", "요즘 스트레스 정도는 어떤가요?",   False, ["거의 없음", "약간", "보통", "심함", "매우 심함"]),
-    ("fatigue",  "😴", "몸과 마음의 피로감은요?",          False, ["거의 없음", "약간", "보통", "피곤함", "완전 지침"]),
+    ("sleep", "🌙", "요즘 잠은 잘 주무시나요?", True, ["거의 못 잠", "뒤척임", "보통", "잘 잠", "아주 푹 잠"]),
+    ("energy", "⚡", "하루 동안 에너지는 어떤가요?", True, ["바닥남", "많이 없음", "보통", "괜찮음", "활기참"]),
+    ("recovery", "🌿", "쉬고 나면 회복이 잘 되시나요?", True, ["전혀", "조금", "보통", "잘 됨", "충분히"]),
+    ("mood", "😊", "전반적인 기분은 어떠세요?", True, ["매우 가라앉음", "우울함", "보통", "좋음", "아주 좋음"]),
+    ("stress", "🔥", "요즘 스트레스 정도는 어떤가요?", False, ["거의 없음", "약간", "보통", "심함", "매우 심함"]),
+    ("fatigue", "😴", "몸과 마음의 피로감은요?", False, ["거의 없음", "약간", "보통", "피곤함", "완전 지침"]),
 ]
 
 SUGGESTED_QUESTIONS = [
     "요즘 너무 지쳐있어요. 번아웃인가요?",
     "수면이 안 좋아서 집중이 안 돼요.",
-    "회복하려면 어떻게 해야 할까요?",
-    "스트레스를 어떻게 풀 수 있을까요?",
+    "회복하려면 오늘 뭘 하면 좋을까요?",
+    "스트레스를 줄이는 방법을 알려주세요.",
 ]
 
 
-@st.cache_resource(show_spinner="잠깐, 문서를 불러오고 있어요 ✨")
-def get_pipeline():
-    rag = MindCareRAGPipeline()
-    rag.build_chain()
-    return rag
+CATEGORY_FOLDERS = ("P0_safety", "P1_burnout", "P2_recovery", "P3_sleep_stress")
 
 
-# ── HTML 헬퍼 ──────────────────────────────────────────────────────────────────
-def thermometer_html(temp: float, tall: bool = True) -> str:
-    if temp >= MindCareRAGPipeline.THRESHOLD_MID:
-        color, label, emoji = C_MINT,   "안정", "☀️"
-    elif temp >= MindCareRAGPipeline.THRESHOLD_HIGH:
-        color, label, emoji = C_YELLOW, "주의", "🌤️"
-    else:
-        color, label, emoji = C_CORAL,  "위험", "🌧️"
-    h    = 150 if tall else 110
-    fill = max(0, min(100, temp))
-    ticks = "".join(
-        f'<div style="position:absolute;right:0;top:{h - m/100*h - 1:.1f}px;'
-        f'width:6px;height:1.5px;background:{C_SUBTEXT};opacity:.4;"></div>'
-        for m in (0, 25, 50, 75, 100)
+def _count_pdfs(base_dir: str) -> int:
+    base = Path(base_dir)
+    total = 0
+    for folder in CATEGORY_FOLDERS:
+        target = base / folder
+        if target.is_dir():
+            total += len(list(target.rglob("*.pdf")))
+    return total
+
+
+def detect_data_dir() -> str:
+    """
+    base.py는 기본적으로 ./data/P0_safety 같은 구조를 찾는다.
+    그런데 현재 사용자 폴더처럼 P0_safety, P1_burnout 폴더가 프로젝트 루트에 바로 있는 경우도 자동으로 인식한다.
+    """
+    data_pdf_count = _count_pdfs("./data")
+    root_pdf_count = _count_pdfs(".")
+
+    if data_pdf_count > 0:
+        return "./data"
+    if root_pdf_count > 0:
+        return "."
+
+    # PDF가 아직 없더라도 폴더가 루트에 있으면 루트 구조로 안내한다.
+    if any((Path(".") / folder).is_dir() for folder in CATEGORY_FOLDERS):
+        return "."
+    return "./data"
+
+
+@st.cache_resource(show_spinner="문서 검색기를 준비하고 있어요 🌿")
+def get_pipeline(data_dir: str) -> MindCareRAGPipeline:
+    return MindCareRAGPipeline(DATA_DIR=data_dir)
+
+
+# -----------------------------------------------------------------------------
+# UI helper
+# -----------------------------------------------------------------------------
+def toggle_theme() -> None:
+    st.session_state.theme = "dark" if st.session_state.theme == "light" else "light"
+    st.query_params["theme"] = st.session_state.theme
+    st.rerun()
+
+
+def badge(text: str, color: str, icon: str = "") -> str:
+    icon_part = f"{icon} " if icon else ""
+    return (
+        f'<span class="pill" style="border-color:{color}55; background:{color}18; color:{color} !important;">'
+        f'{icon_part}{text}</span>'
     )
+
+
+def temp_ring(temp: float) -> str:
+    color, label, emoji = color_for_temp(temp)
     return f"""
-    <div style="display:flex;align-items:center;gap:14px;
-                background:{C_SIDEBAR};border:1px solid {C_BORDER};
-                border-radius:16px;padding:16px 14px;
-                box-shadow:0 2px 12px rgba(0,0,0,.06);
-                animation:scaleIn .4s ease;">
-      <div style="position:relative;width:30px;height:{h+30}px;flex:0 0 auto;">
-        <div style="position:absolute;left:9px;top:0;width:12px;height:{h}px;
-                    background:{C_BORDER};border-radius:999px;overflow:hidden;
-                    box-shadow:inset 0 0 4px rgba(0,0,0,.12);">
-          <div style="position:absolute;bottom:0;left:0;width:100%;height:{fill}%;
-                      background:linear-gradient(180deg,{color},{color}BB);
-                      border-radius:999px;transition:height .8s cubic-bezier(.22,.68,0,1);"></div>
+    <div style="display:flex;align-items:center;gap:18px;">
+      <div class="temp-ring" style="--temp:{max(0, min(100, temp))};--ring-color:{color};">
+        <div class="temp-ring-inner">
+          <div style="text-align:center;">
+            <div class="temp-number" style="color:{color} !important;">{temp}°</div>
+            <div class="temp-text">{emoji} {label}</div>
+          </div>
         </div>
-        {ticks}
-        <div style="position:absolute;left:3px;bottom:0;width:24px;height:24px;
-                    border-radius:50%;background:{color};
-                    box-shadow:0 0 10px {color}88;"></div>
       </div>
       <div>
-        <div style="font-size:11px;color:{C_SUBTEXT};font-weight:600;
-                    letter-spacing:.04em;margin-bottom:2px;">🌡️ 마음 온도</div>
-        <div style="font-size:30px;font-weight:800;color:{color};
-                    line-height:1;letter-spacing:-0.02em;">{emoji} {temp}°</div>
-        <div style="display:inline-block;margin-top:7px;font-size:11px;font-weight:700;
-                    color:{color};background:{color}20;border:1px solid {color}55;
-                    border-radius:999px;padding:2px 11px;letter-spacing:.02em;">{label}</div>
+        <div style="font-size:13px;font-weight:900;color:{TEXT};margin-bottom:6px;">마음 온도</div>
+        <div style="font-size:12px;color:{MUTED};line-height:1.65;">대화 내용을 바탕으로<br>자동으로 변화해요.</div>
       </div>
-    </div>"""
+    </div>
+    """
 
 
-def temp_badge_html(temp: float) -> str:
-    if temp >= MindCareRAGPipeline.THRESHOLD_MID:
-        color, emoji = C_MINT,   "☀️"
-    elif temp >= MindCareRAGPipeline.THRESHOLD_HIGH:
-        color, emoji = C_YELLOW, "🌤️"
-    else:
-        color, emoji = C_CORAL,  "🌧️"
-    return (
-        f'<span style="display:inline-flex;align-items:center;gap:5px;'
-        f'font-size:14px;font-weight:700;letter-spacing:-.01em;'
-        f'color:{color};background:{color}20;border:1px solid {color}55;'
-        f'padding:5px 14px;border-radius:999px;'
-        f'box-shadow:0 2px 8px {color}30;">🌡️ {emoji} {temp}°</span>'
+def header_actions() -> None:
+    left, right = st.columns([1, 1])
+    with left:
+        st.markdown(badge("RAG 기반 멘탈케어", PRIMARY, "🌱"), unsafe_allow_html=True)
+    with right:
+        label = "🌙 다크" if not IS_DARK else "☀️ 라이트"
+        if st.button(label, key=f"theme_{st.session_state.stage}", use_container_width=False):
+            toggle_theme()
+
+
+def onboarding_hero() -> None:
+    st.markdown(
+        """
+        <div class="hero app-shell">
+            <div class="hero-eyebrow">MIND TEMPERATURE CHECK-IN</div>
+            <div class="hero-title">지금 마음 상태를<br>가볍게 확인해볼게요.</div>
+            <p class="hero-sub">
+                6개의 짧은 질문으로 초기 마음 온도를 계산하고, 이후 대화에서는 RAG가 신뢰 자료를 참고해 답변합니다.
+                진단이 아니라 현재 상태를 이해하기 위한 체크인입니다.
+            </p>
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
 
 
-def risk_badge_html(risk: str) -> str:
-    m = {
-        RISK_HIGH: (C_CORAL,   "⚠️ 많이 지쳐 보여요"),
-        RISK_MID:  (C_YELLOW,  "🌤️ 조금 지쳐 보여요"),
-        "low":     (C_PRIMARY, "✅ 안정적이에요"),
-    }
-    color, label = m.get(risk, m["low"])
+def check_bar(label: str, value: int, icon: str, color: str = PRIMARY) -> str:
+    pct = max(0, min(100, value / 5 * 100))
+    # 한 줄 HTML로 반환해야 사이드바에서 <div> 코드가 그대로 노출되지 않음
     return (
-        f'<span style="display:inline-flex;align-items:center;gap:5px;'
-        f'background:{color}1A;border:1px solid {color}66;border-radius:999px;'
-        f'padding:5px 13px;font-size:12px;color:{color};font-weight:600;">{label}</span>'
+        f'<div class="check-row">'
+        f'<div class="check-top"><span>{icon} {label}</span><span style="color:{color} !important;">{value}/5</span></div>'
+        f'<div class="check-bar"><div class="check-fill" style="width:{pct}%;background:linear-gradient(90deg,{color},{color}99);"></div></div>'
+        f'</div>'
     )
 
 
-def hero_card_html() -> str:
-    """채팅 화면 상단 컨텍스트 히어로 카드."""
-    risk = st.session_state.risk_level
-    temp = st.session_state.mind_temp
-
-    if risk == RISK_HIGH:
-        grad_a, grad_b = C_HERO_GRAD_H, C_BG
-        accent = C_CORAL
-        title  = "지금 많이 힘드시죠?"
-        sub    = "괜찮아요. 잠깐, 마음의 짐을 함께 내려놔요."
-        emoji  = "🌧️"
-    elif risk == RISK_MID:
-        grad_a, grad_b = C_HERO_GRAD_M, C_BG
-        accent = C_YELLOW
-        title  = "조금 지쳐 있는 상태예요"
-        sub    = "오늘 하루, 작은 것 하나만 챙겨봐요."
-        emoji  = "🌤️"
-    else:
-        grad_a, grad_b = C_HERO_GRAD_L, C_BG
-        accent = C_PRIMARY
-        title  = "오늘도 안정적이에요"
-        sub    = "이 좋은 상태를 함께 유지해봐요."
-        emoji  = "☀️"
-
-    badge = temp_badge_html(temp)
-    return f"""
-    <div style="
-        background: linear-gradient(135deg, {grad_a}, {grad_b});
-        border: 1px solid {accent}33;
-        border-radius: 20px;
-        padding: 20px 24px;
-        margin-bottom: 18px;
-        animation: fadeSlide .5s ease;
-        box-shadow: 0 4px 24px {accent}14;
-    ">
-        <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;">
-            <div style="font-size:34px;line-height:1;flex-shrink:0;">{emoji}</div>
-            <div style="flex:1;min-width:0;">
-                <div style="font-size:1rem;font-weight:700;color:{C_TEXT};
-                            margin-bottom:3px;letter-spacing:-.01em;">{title}</div>
-                <div style="font-size:0.82rem;color:{C_SUBTEXT};line-height:1.55;">{sub}</div>
-            </div>
-            <div style="flex-shrink:0;">{badge}</div>
-        </div>
-    </div>"""
-
-
-def sidebar_stat_bar(label: str, val: int, icon: str, color: str) -> str:
-    """사이드바용 미니 스탯 바 (점수 1–5)."""
-    pct   = val / 5 * 100
-    stars = "●" * val + "○" * (5 - val)
-    return f"""
-    <div style="margin-bottom:10px;">
-        <div style="display:flex;justify-content:space-between;align-items:center;
-                    font-size:11px;color:{C_SUBTEXT};margin-bottom:4px;">
-            <span>{icon} {label}</span>
-            <span style="color:{color};font-weight:600;letter-spacing:.06em;
-                         font-size:9px;">{stars}</span>
-        </div>
-        <div style="height:5px;background:{C_BORDER};border-radius:999px;overflow:hidden;">
-            <div style="width:{pct}%;height:100%;
-                        background:linear-gradient(90deg,{color},{color}99);
-                        border-radius:999px;
-                        transition:width .8s cubic-bezier(.22,.68,0,1);"></div>
-        </div>
-    </div>"""
-
-
-def recovery_tip_html(answers: dict) -> str:
-    """설문 점수 기반 오늘의 회복 팁."""
-    scores = {
-        "sleep":    answers.get("sleep",    3),
-        "energy":   answers.get("energy",   3),
-        "recovery": answers.get("recovery", 3),
-    }
-    inverted = {"sleep": 6 - scores["sleep"],
-                "energy": 6 - scores["energy"],
-                "recovery": 6 - scores["recovery"]}
-    weak = min(inverted, key=inverted.get)
-
+def recovery_tip(answers: dict[str, int]) -> str:
+    sleep = answers.get("sleep", 3)
+    energy = answers.get("energy", 3)
+    recovery = answers.get("recovery", 3)
+    weak = min({"sleep": sleep, "energy": energy, "recovery": recovery}, key={"sleep": sleep, "energy": energy, "recovery": recovery}.get)
     tips = {
-        "sleep":    ("🌙", "수면 팁", "화면을 1시간 일찍 끄고 짧은 스트레칭 해보세요."),
-        "energy":   ("⚡", "에너지 팁", "15분 햇빛 산책이 오후 에너지를 올려줘요."),
-        "recovery": ("🌿", "회복 팁",  "깊은 호흡 5회로 긴장을 조금씩 풀어보세요."),
+        "sleep": ("🌙", "오늘은 잠을 먼저 챙겨봐요", "자기 전 30분만 화면을 멀리하고, 가벼운 스트레칭으로 몸을 낮춰보세요."),
+        "energy": ("⚡", "에너지를 작게 회복해봐요", "큰 계획보다 10분 산책이나 물 한 컵처럼 바로 가능한 행동부터 시작해보세요."),
+        "recovery": ("🌿", "회복 시간을 따로 떼어놔요", "쉬어도 쉬는 것 같지 않다면, 오늘은 할 일을 하나 줄이는 것도 회복 행동이에요."),
     }
-    icon, ttl, body = tips[weak]
+    icon, title, body = tips[weak]
     return f"""
-    <div style="background:{C_PRIMARY}12;border:1px solid {C_PRIMARY}33;
-                border-radius:12px;padding:10px 12px;margin-top:4px;
-                animation:fadeIn .6s ease;">
-        <div style="font-size:11px;font-weight:700;color:{C_PRIMARY};
-                    margin-bottom:3px;">{icon} 오늘의 {ttl}</div>
-        <div style="font-size:11px;color:{C_SUBTEXT};line-height:1.55;">{body}</div>
-    </div>"""
+    <div class="tip-box">
+      <div style="font-weight:900;color:{PRIMARY};font-size:13px;margin-bottom:5px;">{icon} 오늘의 회복 팁</div>
+      <div style="font-weight:850;font-size:13px;margin-bottom:4px;">{title}</div>
+      <div style="color:{MUTED};font-size:12px;line-height:1.65;">{body}</div>
+    </div>
+    """
 
 
-rag = get_pipeline()
+def render_sidebar() -> None:
+    with st.sidebar:
+        st.markdown(
+            f"""
+            <div class="soft-card">
+              <div style="font-size:20px;font-weight:950;letter-spacing:-.04em;margin-bottom:4px;">🌱 마음온도 RAG</div>
+              <div style="color:{MUTED};font-size:12px;line-height:1.55;">Hybrid Search · Memory · Self-RAG</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.markdown(temp_ring(st.session_state.mind_temp), unsafe_allow_html=True)
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        color, risk_text = risk_label(st.session_state.risk_level)
+        st.markdown(
+            f"<div class='soft-card'><div style='color:{MUTED};font-size:12px;font-weight:800;margin-bottom:8px;'>현재 상태</div>"
+            f"{badge(risk_text, color, '●')}"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+        answers = st.session_state.get("answers", {})
+        if answers:
+            st.markdown(
+                "<div class='soft-card'><div style='font-size:13px;font-weight:900;margin-bottom:10px;'>체크인 요약</div>"
+                + check_bar("수면", answers.get("sleep", 3), "🌙", BLUE)
+                + check_bar("에너지", answers.get("energy", 3), "⚡", YELLOW)
+                + check_bar("회복력", answers.get("recovery", 3), "🌿", PRIMARY)
+                + check_bar("기분", answers.get("mood", 3), "😊", MINT)
+                + check_bar("스트레스 낮음", 6 - answers.get("stress", 3), "🔥", CORAL)
+                + check_bar("피로도 낮음", 6 - answers.get("fatigue", 3), "😴", CORAL)
+                + "</div>",
+                unsafe_allow_html=True,
+            )
+            st.markdown(recovery_tip(answers), unsafe_allow_html=True)
+
+        st.divider()
+        st.caption(f"위급하거나 자해 위험이 있다면 자살예방상담전화 {CRISIS_LINE_SUICIDE} 또는 정신건강 위기상담전화 {CRISIS_LINE_MENTAL}에 연락하세요.")
+        st.session_state.show_debug = st.toggle("개발자 오류 정보 보기", value=st.session_state.show_debug)
+        if st.session_state.show_debug:
+            st.caption(f"현재 RAG 데이터 기준 폴더: {detect_data_dir()} / PDF 수: {_count_pdfs(detect_data_dir())}개")
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# 1) 온보딩 설문
-# ════════════════════════════════════════════════════════════════════════════
-def render_onboarding():
-    # 우상단 테마 토글
-    _, tr = st.columns([7, 1])
-    with tr:
-        label = "🌙" if not _is_dark else "☀️"
-        if st.button(label, key="theme_onboarding", help="라이트/다크 전환"):
-            _toggle_theme()
+def render_onboarding() -> None:
+    render_sidebar()
+    header_actions()
+    onboarding_hero()
 
-    step  = st.session_state.survey_step
+    step = st.session_state.survey_step
     total = len(SURVEY)
 
     if step < total:
-        key, icon, q, _positive, scale = SURVEY[step]
-        st.progress(step / total, text=f"마음 체크인 설문 · {step + 1} / {total}")
+        key, icon, question, _positive, scale = SURVEY[step]
+        progress = step / total
+        st.progress(progress, text=f"체크인 {step + 1} / {total}")
+
         st.markdown(
-            f"<div style='font-size:44px;margin:10px 0 2px;animation:fadeSlide .4s ease;'>"
-            f"{icon}</div>",
+            f"""
+            <div class="soft-card app-shell">
+              <div style="font-size:44px;margin-bottom:8px;">{icon}</div>
+              <div style="font-size:25px;font-weight:950;letter-spacing:-.045em;margin-bottom:8px;">{question}</div>
+              <div style="color:{MUTED};font-size:13px;margin-bottom:18px;">가장 가까운 답을 하나 골라주세요.</div>
+            </div>
+            """,
             unsafe_allow_html=True,
         )
-        st.markdown(
-            f"<div style='font-size:1.3rem;font-weight:700;color:{C_TEXT};"
-            f"letter-spacing:-.02em;margin-bottom:20px;animation:fadeSlide .45s ease;'>"
-            f"{q}</div>",
-            unsafe_allow_html=True,
-        )
-        for i, label in enumerate(scale):
-            if st.button(f"{i+1}.  {label}", key=f"opt_{step}_{i}", use_container_width=True):
-                st.session_state.answers[key] = i + 1
-                st.session_state.survey_step  += 1
-                st.rerun()
-        if step > 0:
-            if st.button("← 이전", key="prev"):
+
+        cols = st.columns([1, 1, 1, 1, 1])
+        for idx, option in enumerate(scale):
+            with cols[idx]:
+                if st.button(f"{idx + 1}\n\n{option}", key=f"survey_{key}_{idx}", use_container_width=True):
+                    st.session_state.answers[key] = idx + 1
+                    st.session_state.survey_step += 1
+                    st.rerun()
+
+        nav_l, nav_r = st.columns([1, 5])
+        with nav_l:
+            if step > 0 and st.button("← 이전", use_container_width=True):
                 st.session_state.survey_step -= 1
                 st.rerun()
+        with nav_r:
+            st.caption("응답은 앱 안에서 현재 세션의 맞춤 답변을 위해 사용됩니다.")
         return
 
-    # ── 결과 화면 ──
     filled = {k: st.session_state.answers.get(k, 3) for (k, *_rest) in SURVEY}
-    temp   = rag.set_initial_temperature(st.session_state.session_id, filled)
+    temp = rag.set_initial_temperature(st.session_state.session_id, filled)
     if temp < MindCareRAGPipeline.THRESHOLD_HIGH:
-        risk, desc = RISK_HIGH, "지금 많이 지쳐 계신 것 같아요. 천천히, 함께 이야기 나눠요."
+        risk = RISK_HIGH
+        result_title = "지금은 회복을 먼저 챙겨야 할 수 있어요."
+        result_body = "많이 지쳐 있는 상태로 보입니다. 대화에서는 부담을 낮추고 안전한 도움 연결을 우선으로 안내할게요."
     elif temp < MindCareRAGPipeline.THRESHOLD_MID:
-        risk, desc = RISK_MID,  "조금 지쳐 계신 상태예요. 가벼운 것부터 살펴봐요."
+        risk = RISK_MID
+        result_title = "조금 지쳐 있는 상태예요."
+        result_body = "작게 실천할 수 있는 회복 행동과 학업·일상 조절 방법을 중심으로 안내할게요."
     else:
-        risk, desc = "low",     "비교적 안정적이에요. 예방 차원에서 함께 점검해 봐요."
+        risk = "low"
+        result_title = "비교적 안정적인 상태예요."
+        result_body = "현재 상태를 유지하고 번아웃을 예방하는 방향으로 도와드릴게요."
 
+    color, label, emoji = color_for_temp(temp)
+    risk_color, risk_text = risk_label(risk)
     st.markdown(
-        f"<p style='text-align:center;color:{C_SUBTEXT};font-size:0.88rem;"
-        f"letter-spacing:.02em;margin-bottom:4px;'>설문 결과 · 초기 마음 온도</p>",
+        f"""
+        <div class="hero app-shell" style="text-align:center;">
+            <div class="hero-eyebrow">CHECK-IN RESULT</div>
+            <div style="display:flex;justify-content:center;margin:12px 0 20px;">{temp_ring(temp)}</div>
+            <div style="margin-bottom:12px;">{badge(risk_text, risk_color, emoji)}</div>
+            <div style="font-size:25px;font-weight:950;letter-spacing:-.045em;margin-bottom:8px;">{result_title}</div>
+            <p class="hero-sub" style="margin:0 auto;">{result_body}</p>
+        </div>
+        """,
         unsafe_allow_html=True,
     )
-    st.markdown(
-        f"<div style='display:flex;justify-content:center;margin-bottom:12px;'>"
-        f"{thermometer_html(temp)}</div>",
-        unsafe_allow_html=True,
-    )
-    st.markdown(
-        f"<div style='text-align:center;margin-bottom:8px;'>{risk_badge_html(risk)}</div>",
-        unsafe_allow_html=True,
-    )
-    st.markdown(
-        f"<p style='text-align:center;color:{C_SUBTEXT};font-size:0.9rem;"
-        f"line-height:1.7;margin-bottom:20px;'>{desc}</p>",
-        unsafe_allow_html=True,
-    )
+
     if st.button("상담 시작하기 →", type="primary", use_container_width=True):
-        st.session_state.mind_temp  = temp
+        st.session_state.mind_temp = temp
         st.session_state.risk_level = risk
         greet = (
-            f"체크인 결과 마음 온도가 {temp}°네요. 요즘 정말 많이 지쳐 계신 것 같아요. "
-            "어떤 부분이 가장 힘드신지 편하게 말씀해 주시겠어요? 함께 이야기 나눠봐요."
-            if risk == RISK_HIGH else
-            f"마음 온도 {temp}°, 조금 지쳐 계신 것 같아요. "
-            "오늘 가장 신경 쓰이는 점부터 가볍게 시작해 봐요."
-            if risk == RISK_MID else
-            f"마음 온도 {temp}°, 지금 비교적 안정적이시네요! "
-            "번아웃 예방이나 회복에 대해 궁금한 점을 편하게 물어보세요."
+            f"체크인 결과 마음 온도가 {temp}°로 나왔어요. 지금 많이 지쳐 계실 수 있으니, 가장 부담되는 부분부터 천천히 이야기해 주세요."
+            if risk == RISK_HIGH
+            else f"마음 온도는 {temp}°예요. 조금 지쳐 있는 상태로 보여요. 오늘 가장 신경 쓰이는 것부터 가볍게 이야기해볼까요?"
+            if risk == RISK_MID
+            else f"마음 온도는 {temp}°예요. 비교적 안정적인 상태네요. 번아웃 예방이나 회복에 대해 궁금한 점을 편하게 물어보세요."
         )
         st.session_state.messages = [{"role": "assistant", "content": greet}]
-        st.session_state.stage    = "chat"
+        st.session_state.stage = "chat"
         st.rerun()
 
-    st.caption("⚠️ 본 서비스는 의료 행위가 아닙니다. 마음 온도는 이후 대화를 통해 자동으로 조정됩니다.")
+    st.caption("본 서비스는 의료 행위가 아니며, 마음 온도는 진단이 아닌 참고용 지표입니다.")
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# 2) 채팅
-# ════════════════════════════════════════════════════════════════════════════
-def render_chat():
-    answers = st.session_state.get("answers", {})
-
-    # ── 사이드바 대시보드 ─────────────────────────────────────────────
-    with st.sidebar:
-        st.markdown(
-            f"<h3 style='color:{C_TEXT};font-size:1.05rem;"
-            f"font-weight:700;letter-spacing:-.02em;margin-bottom:2px;'>"
-            f"🌱 번아웃 예방 RAG</h3>",
-            unsafe_allow_html=True,
+def run_rag(prompt: str) -> dict[str, Any]:
+    try:
+        return rag.ask(prompt, session_id=st.session_state.session_id)
+    except FileNotFoundError as e:
+        answer = (
+            "문서 PDF를 찾지 못해서 RAG 답변을 만들 수 없어요.\n\n"
+            "현재 앱은 `data/P0_safety...` 구조와 프로젝트 바로 아래 `P0_safety...` 구조를 모두 자동으로 확인합니다. "
+            "각 카테고리 폴더 안에 PDF가 들어있는지 확인하고, 기존 `faiss_db` 폴더가 있으면 삭제한 뒤 다시 실행해 주세요."
         )
-        st.caption("Hybrid(BM25+FAISS) · Self-RAG")
-        st.markdown(thermometer_html(st.session_state.mind_temp), unsafe_allow_html=True)
-        st.markdown(
-            f"<p style='font-size:10.5px;color:{C_SUBTEXT};text-align:center;"
-            f"line-height:1.65;margin-top:8px;'>"
-            "🔒 마음 온도는 직접 조절할 수 없어요.<br>대화를 통해 자동으로 변화합니다.</p>",
-            unsafe_allow_html=True,
-        )
-        st.divider()
+        if st.session_state.show_debug:
+            answer += f"\n\n오류 내용: `{e}`"
+    except Exception as e:
+        answer = "실행 중 오류가 났어요. API 키, 패키지 설치, data 폴더 구조를 확인해 주세요."
+        if st.session_state.show_debug:
+            answer += f"\n\n오류 내용: `{type(e).__name__}: {e}`"
+    else:
+        return answer  # type: ignore[return-value]
 
-        # 현재 위험군
-        st.markdown(
-            f"<p style='font-size:11px;color:{C_SUBTEXT};font-weight:600;"
-            f"letter-spacing:.04em;margin-bottom:6px;'>현재 위험군</p>",
-            unsafe_allow_html=True,
-        )
-        st.markdown(risk_badge_html(st.session_state.risk_level), unsafe_allow_html=True)
+    return {
+        "answer": answer,
+        "mind_temperature": st.session_state.mind_temp,
+        "risk_level": st.session_state.risk_level,
+        "temp_delta": None,
+        "delta_reason": "",
+        "critique": None,
+    }
 
-        # 미니 스탯 카드 (설문 응답 있을 때)
-        if answers:
-            st.markdown(
-                f"<p style='font-size:11px;color:{C_SUBTEXT};font-weight:600;"
-                f"letter-spacing:.04em;margin-top:14px;margin-bottom:8px;'>"
-                "체크인 점수</p>",
-                unsafe_allow_html=True,
-            )
-            st.markdown(
-                sidebar_stat_bar("수면",   answers.get("sleep",    3), "🌙", C_BLUE)
-                + sidebar_stat_bar("에너지", answers.get("energy",   3), "⚡", C_YELLOW)
-                + sidebar_stat_bar("회복력", answers.get("recovery", 3), "🌿", C_PRIMARY),
-                unsafe_allow_html=True,
-            )
-            st.markdown(recovery_tip_html(answers), unsafe_allow_html=True)
 
-        st.divider()
+def render_chat() -> None:
+    render_sidebar()
+    header_actions()
 
-        # 테마 토글
-        st.markdown(
-            f"<p style='font-size:10.5px;color:{C_SUBTEXT};font-weight:600;"
-            f"letter-spacing:.04em;margin-bottom:6px;'>🎨 화면 테마</p>",
-            unsafe_allow_html=True,
-        )
-        toggle_label = "🌙  다크 모드로 전환" if not _is_dark else "☀️  라이트 모드로 전환"
-        if st.button(toggle_label, key="theme_chat", use_container_width=True):
-            _toggle_theme()
+    color, label, emoji = color_for_temp(st.session_state.mind_temp)
+    risk_color, risk_text = risk_label(st.session_state.risk_level)
+    st.markdown(
+        f"""
+        <div class="hero app-shell">
+            <div class="hero-eyebrow">BURNOUT CARE CHATBOT</div>
+            <div style="display:flex;align-items:center;justify-content:space-between;gap:18px;flex-wrap:wrap;">
+                <div>
+                    <div class="hero-title">번아웃 예방 및 관리 RAG</div>
+                    <p class="hero-sub">신뢰할 수 있는 문서를 검색하고, 현재 마음 온도와 대화 맥락을 반영해 답변합니다.</p>
+                </div>
+                <div style="display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end;">
+                    {badge(f'{emoji} {st.session_state.mind_temp}°', color, '🌡️')}
+                    {badge(risk_text, risk_color, '●')}
+                </div>
+            </div>
+            <div class="metric-grid">
+                <div class="metric-card"><div class="metric-label">검색 방식</div><div class="metric-value">BM25 + FAISS</div></div>
+                <div class="metric-card"><div class="metric-label">대화 기억</div><div class="metric-value">Memory</div></div>
+                <div class="metric-card"><div class="metric-label">검증</div><div class="metric-value">Self-RAG</div></div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
-        st.caption(
-            f"⚠️ 본 서비스는 의료 행위가 아닙니다.\n"
-            f"위급 시 자살예방상담전화 {CRISIS_LINE_SUICIDE}."
-        )
-
-    # ── 메인 헤더 ─────────────────────────────────────────────────────
-    left, right = st.columns([3, 1])
-    with left:
-        st.markdown(
-            f"<h3 style='color:{C_TEXT};margin:0;font-weight:700;"
-            f"letter-spacing:-.03em;font-size:1.25rem;'>🌱 번아웃 예방 및 관리 RAG</h3>",
-            unsafe_allow_html=True,
-        )
-    with right:
-        st.markdown(
-            f"<div style='text-align:right;padding-top:6px;'>"
-            f"{temp_badge_html(st.session_state.mind_temp)}</div>",
-            unsafe_allow_html=True,
-        )
-    st.divider()
-
-    # ── Hero 카드 ─────────────────────────────────────────────────────
-    st.markdown(hero_card_html(), unsafe_allow_html=True)
-
-    # ── 대화 렌더링 ──────────────────────────────────────────────────
     for msg in st.session_state.messages:
-        with st.chat_message(msg["role"]):
+        avatar = "🌱" if msg["role"] == "assistant" else "🙂"
+        with st.chat_message(msg["role"], avatar=avatar):
             st.markdown(msg["content"])
 
-    # ── 추천 질문 (첫 화면) ──────────────────────────────────────────
     if len(st.session_state.messages) <= 1:
+        st.markdown("<div class='suggest-title'>바로 물어볼 수 있는 질문</div>", unsafe_allow_html=True)
         cols = st.columns(2)
-        for i, q in enumerate(SUGGESTED_QUESTIONS):
-            if cols[i % 2].button(q, key=f"sq_{i}", use_container_width=True):
-                st.session_state.pending_message = q
-                st.rerun()
+        for i, question in enumerate(SUGGESTED_QUESTIONS):
+            with cols[i % 2]:
+                if st.button(question, key=f"suggest_{i}", use_container_width=True):
+                    st.session_state.pending_message = question
+                    st.rerun()
 
-    # ── 입력 처리 ─────────────────────────────────────────────────────
-    prompt = st.chat_input("요즘 어떤 점이 힘드세요?")
     if st.session_state.pending_message:
         prompt = st.session_state.pending_message
         st.session_state.pending_message = None
+    else:
+        prompt = st.chat_input("요즘 어떤 점이 가장 힘드세요?")
 
-    if prompt:
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
+    if not prompt:
+        return
 
-        with st.chat_message("assistant"):
-            with st.spinner("잠깐, 마음의 이야기를 찾고 있어요... 🌿"):
-                result = rag.ask(prompt, session_id=st.session_state.session_id)
-            st.markdown(result["answer"])
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    with st.chat_message("user", avatar="🙂"):
+        st.markdown(prompt)
 
-            st.session_state.mind_temp  = result["mind_temperature"]
-            st.session_state.risk_level = result["risk_level"]
+    with st.chat_message("assistant", avatar="🌱"):
+        with st.spinner("관련 문서를 찾고 답변을 정리하고 있어요... 🌿"):
+            result = run_rag(prompt)
+        st.markdown(result["answer"])
 
-            d = result.get("temp_delta")
-            if d:
-                arrow = "▲" if d > 0 else "▼"
-                tone  = C_PRIMARY if d > 0 else C_CORAL
-                st.markdown(
-                    f"<p style='font-size:0.76rem;color:{tone};margin-top:5px;"
-                    f"letter-spacing:.01em;'>"
-                    f"{arrow} 마음 온도 {'+' if d > 0 else ''}{d}° "
-                    f"→ {result['mind_temperature']}° "
-                    f"<span style='color:{C_SUBTEXT};'>"
-                    f"({result.get('delta_reason', '')})</span></p>",
-                    unsafe_allow_html=True,
-                )
+        st.session_state.mind_temp = result.get("mind_temperature", st.session_state.mind_temp)
+        st.session_state.risk_level = result.get("risk_level", st.session_state.risk_level)
 
-            if result["risk_level"] == RISK_HIGH:
-                st.markdown(
-                    f"""<div style="background:{C_ALERT_BG};
-                                   border-left:3px solid {C_CORAL};
-                                   border-radius:0 12px 12px 0;
-                                   padding:0.8rem 1.1rem;margin-top:0.8rem;
-                                   font-size:0.83rem;color:{C_TEXT};line-height:1.9;">
-                        <strong>힘든 마음이 클 때는 전문가의 도움이 큰 힘이 돼요.</strong><br>
-                        📞 자살예방 상담전화 <strong>{CRISIS_LINE_SUICIDE}</strong>&nbsp;(24시간)<br>
-                        📞 정신건강 위기상담전화 <strong>{CRISIS_LINE_MENTAL}</strong>&nbsp;(24시간)<br>
-                        🏫 학교 상담센터
-                    </div>""",
-                    unsafe_allow_html=True,
-                )
+        delta = result.get("temp_delta")
+        if delta:
+            d_color = PRIMARY if delta > 0 else CORAL
+            arrow = "▲" if delta > 0 else "▼"
+            st.markdown(
+                f"<div class='tip-box' style='margin-top:10px;border-color:{d_color}44;background:{d_color}12;'>"
+                f"<span style='color:{d_color} !important;font-weight:900;'>{arrow} 마음 온도 {'+' if delta > 0 else ''}{delta}°</span>"
+                f"<span style='color:{MUTED} !important;'> → {result['mind_temperature']}° · {result.get('delta_reason', '')}</span>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
 
-        st.session_state.messages.append({"role": "assistant", "content": result["answer"]})
-        st.rerun()
+        if result.get("risk_level") == RISK_HIGH:
+            st.markdown(
+                f"""
+                <div class="tip-box" style="margin-top:10px;border-color:{CORAL}55;background:{CORAL}14;">
+                    <div style="font-weight:950;color:{CORAL} !important;margin-bottom:5px;">긴급 도움 안내</div>
+                    <div style="font-size:13px;line-height:1.8;">
+                    힘든 마음이 클 때는 혼자 감당하지 않아도 괜찮아요.<br>
+                    📞 자살예방상담전화 <b>{CRISIS_LINE_SUICIDE}</b> · 📞 정신건강 위기상담전화 <b>{CRISIS_LINE_MENTAL}</b> · 🏫 학교 상담센터
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+    st.session_state.messages.append({"role": "assistant", "content": result["answer"]})
+    st.rerun()
 
 
-# ── 라우팅 ─────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
+# 라우팅
+# -----------------------------------------------------------------------------
+DATA_DIR_USED = detect_data_dir()
+rag = get_pipeline(DATA_DIR_USED)
+
 if st.session_state.stage == "onboarding":
     render_onboarding()
 else:
