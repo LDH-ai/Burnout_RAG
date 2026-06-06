@@ -1,315 +1,104 @@
 from __future__ import annotations
 
-import os
-import uuid
-
-import pandas as pd
 import streamlit as st
 
-if "OPENAI_API_KEY" not in os.environ:
-    try:
-        if "OPENAI_API_KEY" in st.secrets:
-            os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_API_KEY"]
-    except Exception:
-        pass
-
-from base import (
-    Phase1FaissPipeline,
-    Phase2MemoryPipeline,
-    Phase3HybridPipeline,
-    Phase3SelfRAGPipeline,
-    RISK_HIGH,
-    CRISIS_LINE_SUICIDE,
-    CRISIS_LINE_MENTAL,
-)
+from base import SelfRAGPipeline
+from ui.checkin_insights import init_checkin_state, render_checkin, render_checkin_sidebar
+from ui.components import render_safety_note
+from ui.layout import render_answer, render_main_header
+from ui.styles import inject_sidebar_hidden_styles, inject_styles
+from ui.theme import get_theme
 
 st.set_page_config(
-    page_title="🌱번아웃 예방 및 관리 RAG🌱",
-    page_icon="🌱",
-    layout="centered",
+    page_title="조용한 회복 공간",
+    page_icon="🌿",
+    layout="wide",
+    initial_sidebar_state="collapsed",
 )
 
-# ── Design tokens ─────────────────────────────────────────────────────────────
-C_BG      = "#F8F4EF"
-C_CARD    = "#FFFFFF"
-C_BLUE    = "#6B9EC7"
-C_MINT    = "#7CC8A0"
-C_YELLOW  = "#F5C842"
-C_CORAL   = "#F4856A"
-C_TEXT    = "#2D3436"
-C_SUBTEXT = "#8A9BA8"
-C_BORDER  = "#E8E2DA"
+theme = get_theme()
+inject_styles(theme)
 
-st.markdown(f"""
-<style>
-    /* 기본 배경 */
-    .stApp {{ background-color: {C_BG} !important; }}
-    .stApp, .stApp * {{ color: {C_TEXT}; }}
-
-    /* 사이드바 */
-    section[data-testid="stSidebar"] {{
-        background: {C_CARD} !important;
-        border-right: 1px solid {C_BORDER};
-    }}
-    section[data-testid="stSidebar"] * {{ color: {C_TEXT} !important; }}
-
-    /* 본문 */
-    .main .block-container {{ max-width: 760px; padding-top: 1.5rem; }}
-
-    /* 채팅 말풍선 */
-    [data-testid="stChatMessage"] {{
-        border-radius: 16px !important;
-        border: 1px solid {C_BORDER} !important;
-        background: {C_CARD} !important;
-        margin-bottom: 6px !important;
-    }}
-    [data-testid="stChatMessage"] p,
-    [data-testid="stChatMessage"] div {{
-        color: {C_TEXT} !important;
-    }}
-
-    /* 입력창 */
-    [data-testid="stChatInput"] textarea {{
-        border-radius: 24px !important;
-        background: {C_CARD} !important;
-        border: 1.5px solid {C_BORDER} !important;
-        color: {C_TEXT} !important;
-    }}
-    [data-testid="stChatInput"] textarea:focus {{
-        border-color: {C_BLUE} !important;
-        box-shadow: 0 0 0 2px {C_BLUE}22 !important;
-    }}
-
-    /* 버튼 */
-    .stButton > button {{
-        border-radius: 20px !important;
-        border: 1.5px solid {C_BORDER} !important;
-        background: {C_CARD} !important;
-        color: {C_TEXT} !important;
-        font-size: 0.85rem !important;
-        transition: border-color 0.15s, color 0.15s !important;
-        white-space: normal !important;
-        height: auto !important;
-    }}
-    .stButton > button:hover {{
-        border-color: {C_BLUE} !important;
-        color: {C_BLUE} !important;
-    }}
-
-    /* 불필요한 Streamlit UI 숨김 */
-    footer, #MainMenu, header {{ visibility: hidden; }}
-
-    /* expander 텍스트 */
-    .streamlit-expanderHeader {{ color: {C_TEXT} !important; }}
-</style>
-""", unsafe_allow_html=True)
-
-
-# ── 상수 ──────────────────────────────────────────────────────────────────────
-PHASE_OPTIONS = {
-    "Phase 2 · 메모리(권장)":       Phase2MemoryPipeline,
-    "Phase 1 · 기본 FAISS":         Phase1FaissPipeline,
-    "Phase 3 · Hybrid(BM25+FAISS)": Phase3HybridPipeline,
-    "Phase 3 · Hybrid+Self-RAG":    Phase3SelfRAGPipeline,
-}
-
-# 첫 인사에 대한 자연스러운 응답 예시
-CONV_STARTERS = [
-    "좋은 하루를 보냈어요 😊",
-    "조금 지치고 힘든 하루였어요 😔",
-    "많이 지쳐서 아무것도 하기 싫어요 😞",
-    "그냥 누군가와 이야기하고 싶었어요",
-]
-
-GREETING = (
-    "안녕하세요! 저는 번아웃과 마음 회복을 도와드리는 상담 도우미예요. 😊\n\n"
-    "오늘 하루는 어떠셨나요?"
-)
-
-
-# ── 파이프라인 캐시 ────────────────────────────────────────────────────────────
-@st.cache_resource(show_spinner="잠깐, 문서를 불러오고 있어요 ✨")
-def get_pipeline(phase_label: str):
-    rag = PHASE_OPTIONS[phase_label]()
-    rag.build_chain()
-    return rag
-
-
-# ── 세션 상태 초기화 ───────────────────────────────────────────────────────────
-if "session_id"          not in st.session_state:
-    st.session_state.session_id          = f"user-{uuid.uuid4().hex[:8]}"
-if "messages"            not in st.session_state:
-    st.session_state.messages            = []
-if "phase_label"         not in st.session_state:
-    st.session_state.phase_label         = "Phase 2 · 메모리(권장)"
-if "pending_message"     not in st.session_state:
-    st.session_state.pending_message     = None
-if "current_temperature" not in st.session_state:
-    st.session_state.current_temperature = 65.0  # 첫 진입 기본값 (중립)
-
-
-# ── 온도계 HTML ────────────────────────────────────────────────────────────────
-def _temp_gauge(temp: float, thr_high: float, thr_mid: float) -> str:
-    if temp < thr_high:
-        color, label, desc = C_CORAL,  "번아웃 위험", "많이 힘드셨겠어요. 혼자 견디지 않아도 괜찮아요."
-    elif temp < thr_mid:
-        color, label, desc = C_YELLOW, "피로 주의",   "조금 지쳐 보여요. 작은 회복부터 찾아봐요."
-    else:
-        color, label, desc = C_MINT,   "안정",        "비교적 안정적이에요. 지금 리듬을 잘 지켜봐요."
-
-    pct = min(max(temp, 3), 97)
-
-    return f"""
-    <div style="padding:0.5rem 0;">
-        <div style="text-align:center;margin-bottom:0.75rem;">
-            <span style="font-size:2.4rem;font-weight:700;color:{color};line-height:1;">{temp}</span>
-            <span style="font-size:0.9rem;color:{C_SUBTEXT};">&thinsp;/ 100</span>
-            <span style="background:{color}25;color:{color};font-size:0.72rem;font-weight:600;
-                         padding:2px 9px;border-radius:10px;margin-left:6px;vertical-align:middle;">
-                {label}
-            </span>
-        </div>
-        <div style="position:relative;height:10px;border-radius:5px;
-                    background:linear-gradient(to right,
-                        {C_CORAL} 0%, {C_YELLOW} 35%, {C_MINT} 60%, {C_BLUE} 100%);">
-            <div style="position:absolute;left:calc({pct}% - 10px);top:-5px;
-                        width:20px;height:20px;border-radius:50%;
-                        background:white;border:3px solid {color};
-                        box-shadow:0 2px 6px rgba(0,0,0,0.15);"></div>
-        </div>
-        <p style="font-size:0.77rem;color:{C_SUBTEXT};text-align:center;
-                  margin:0.55rem 0 0;line-height:1.5;">{desc}</p>
-    </div>
-    """
-
-
-# ── 파이프라인 로드 ────────────────────────────────────────────────────────────
-rag = get_pipeline(st.session_state.phase_label)
-
-# 최초 방문 시 자동 인사
-if not st.session_state.messages:
-    st.session_state.messages = [{"role": "assistant", "content": GREETING}]
-
-
-# ── 사이드바 ───────────────────────────────────────────────────────────────────
-with st.sidebar:
-    st.markdown(
-        f"<h2 style='font-size:1.25rem;font-weight:700;margin:0;color:{C_TEXT};'>🌱 마음 회복</h2>"
-        f"<p style='font-size:0.78rem;color:{C_SUBTEXT};margin:2px 0 1rem;'>AI 심리 회복 도우미</p>",
-        unsafe_allow_html=True,
-    )
-
-    with st.expander("⚙️ 검색 엔진", expanded=False):
-        phase_label = st.selectbox(
-            "파이프라인",
-            list(PHASE_OPTIONS.keys()),
-            index=list(PHASE_OPTIONS.keys()).index(st.session_state.phase_label),
-            label_visibility="collapsed",
-            help="Phase 3는 kiwipiepy·rank_bm25 설치 필요",
+if "rag" not in st.session_state:
+    try:
+        st.session_state.rag = SelfRAGPipeline()
+        st.session_state.rag.build_vectorstore()
+        st.session_state.rag.build_chain()
+    except Exception as exc:
+        st.error(
+            f"초기화 오류: {exc}\n\n"
+            "`data/.env` 파일에 `OPENAI_API_KEY`가 설정되어 있는지 확인하세요."
         )
-        if phase_label != st.session_state.phase_label:
-            st.session_state.phase_label         = phase_label
-            st.session_state.messages            = []
-            st.session_state.session_id          = f"user-{uuid.uuid4().hex[:8]}"
-            st.session_state.current_temperature = 65.0
-            st.rerun()
+        st.stop()
 
-    st.markdown(
-        f"<p style='font-size:0.88rem;font-weight:600;color:{C_TEXT};margin:0.75rem 0 0.25rem;'>"
-        f"🌡️ 마음 온도</p>"
-        f"<p style='font-size:0.76rem;color:{C_SUBTEXT};margin-bottom:0.4rem;'>"
-        f"대화 내용을 분석해 자동으로 업데이트돼요.</p>",
-        unsafe_allow_html=True,
-    )
+init_checkin_state()
 
-    # 온도계 — 대화 분석 결과로만 구동
-    st.markdown(
-        _temp_gauge(
-            st.session_state.current_temperature,
-            rag.THRESHOLD_HIGH,
-            rag.THRESHOLD_MID,
-        ),
-        unsafe_allow_html=True,
-    )
+SESSION_ID = "main"
 
-    # 온도 추이 그래프
-    history = rag.get_temperature_history(st.session_state.session_id)
-    if len(history) > 1:
-        st.markdown(
-            f"<p style='font-size:0.8rem;color:{C_SUBTEXT};margin:0.5rem 0 0.25rem;'>📈 마음 온도 추이</p>",
-            unsafe_allow_html=True,
-        )
-        df = pd.DataFrame(history).set_index("date")
-        st.area_chart(df["temperature"], height=120, color=C_BLUE)
+# ── 스테이지 라우팅 ───────────────────────────────────────────────────────────
+if st.session_state.stage != "chat":
+    # 체크인 단계: 사이드바·채팅 입력·채팅 메시지 모두 숨김
+    inject_sidebar_hidden_styles()
+    render_checkin(st.session_state.rag)
 
-    st.divider()
-    if st.button("🗑️ 대화 초기화", use_container_width=True):
-        st.session_state.messages            = []
-        st.session_state.session_id          = f"user-{uuid.uuid4().hex[:8]}"
-        st.session_state.current_temperature = 65.0
-        st.rerun()
+else:
+    # 체크인 완료 후: 사이드바 표시
+    render_checkin_sidebar()
 
+    # 채팅 히어로 표시 (체크인 완료 후에만)
+    render_main_header(theme)
 
-# ── 메인 ──────────────────────────────────────────────────────────────────────
-st.markdown(
-    f"<h1 style='font-size:1.6rem;font-weight:700;color:{C_TEXT};margin-bottom:0;'>🌱 마음 회복 챗봇</h1>"
-    f"<p style='color:{C_SUBTEXT};font-size:0.82rem;margin:4px 0 1.25rem;'>"
-    f"번아웃·수면·스트레스 회복을 돕는 AI 상담 도우미예요. "
-    f"의료 행위가 아니며, 위급할 때는 전문기관에 연락해 주세요.</p>",
-    unsafe_allow_html=True,
-)
+    # 채팅 히스토리 표시
+    user_av = st.session_state.get("user_avatar", "🧑")
+    asst_av = st.session_state.get("assistant_avatar", "🌿")
 
-# 대화 이력 출력
-for msg in st.session_state.messages:
-    with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
+    for msg in st.session_state.messages:
+        avatar = asst_av if msg["role"] == "assistant" else user_av
+        with st.chat_message(msg["role"], avatar=avatar):
+            if msg["role"] == "assistant":
+                st.markdown(msg["content"])
+                if msg.get("caveat"):
+                    st.markdown(
+                        f"<p style='margin:0.6rem 0 0; font-size:0.72rem;"
+                        f" color:{theme['MUTED']}; line-height:1.5;"
+                        f" font-style:italic;'>{msg['caveat']}</p>",
+                        unsafe_allow_html=True,
+                    )
+                if msg.get("safety_note"):
+                    render_safety_note(msg["safety_note"], theme)
+            else:
+                st.markdown(msg["content"])
 
-# 첫 인사 직후에만 대화 시작 예시 표시
-if len(st.session_state.messages) == 1:
-    st.markdown(
-        f"<p style='font-size:0.82rem;color:{C_SUBTEXT};margin-bottom:0.4rem;'>오늘 어떠셨나요?</p>",
-        unsafe_allow_html=True,
-    )
-    cols = st.columns(2)
-    for i, starter in enumerate(CONV_STARTERS):
-        if cols[i % 2].button(starter, key=f"cs_{i}", use_container_width=True):
-            st.session_state.pending_message = starter
-            st.rerun()
+    # 채팅 입력창 표시 (체크인 완료 후에만)
+    user_input = st.chat_input("오늘 어떤 이야기를 나누고 싶으세요?")
 
-# 입력 처리
-prompt = st.chat_input("마음을 편하게 이야기해 보세요")
-if st.session_state.pending_message:
-    prompt                           = st.session_state.pending_message
-    st.session_state.pending_message = None
+    if user_input:
+        st.session_state.messages.append({"role": "user", "content": user_input})
+        with st.chat_message("user", avatar=user_av):
+            st.markdown(user_input)
 
-if prompt:
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.markdown(prompt)
+        with st.chat_message("assistant", avatar=asst_av):
+            with st.spinner("생각하는 중..."):
+                checkin_answers = st.session_state.answers or None
+                response = st.session_state.rag.ask(
+                    question=user_input,
+                    session_id=SESSION_ID,
+                    checkin=checkin_answers,
+                )
 
-    with st.chat_message("assistant"):
-        with st.spinner(""):
-            result = rag.ask(prompt, session_id=st.session_state.session_id)
-        st.markdown(result["answer"])
+            render_answer(response, theme)
 
-        # 고위험 시 위기 자원 배너
-        if result["risk_level"] == RISK_HIGH:
-            st.markdown(
-                f"""<div style="background:#FFF0EE;border-left:3px solid {C_CORAL};
-                               border-radius:0 8px 8px 0;padding:0.7rem 1rem;
-                               margin-top:0.75rem;font-size:0.83rem;
-                               color:{C_TEXT};line-height:1.8;">
-                    <strong>힘든 마음이 클 때는 전문가의 도움이 큰 힘이 돼요.</strong><br>
-                    📞 자살예방 상담전화 <strong>{CRISIS_LINE_SUICIDE}</strong>&nbsp;(24시간)<br>
-                    📞 정신건강 위기상담전화 <strong>{CRISIS_LINE_MENTAL}</strong>&nbsp;(24시간)<br>
-                    🏫 학교 상담센터
-                </div>""",
-                unsafe_allow_html=True,
+            st.session_state.mind_temp = response.get(
+                "mind_temperature", st.session_state.mind_temp
+            )
+            st.session_state.risk_level = response.get("risk_level")
+            st.session_state.messages.append(
+                {
+                    "role": "assistant",
+                    "content": response.get("core_answer") or response.get("answer", ""),
+                    "caveat": response.get("caveat", ""),
+                    "safety_note": response.get("safety_note", ""),
+                }
             )
 
-    # 온도 업데이트 (대화 분석 결과)
-    if result["mind_temperature"] is not None:
-        st.session_state.current_temperature = result["mind_temperature"]
-
-    st.session_state.messages.append({"role": "assistant", "content": result["answer"]})
-    st.rerun()
+        st.rerun()
