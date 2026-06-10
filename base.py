@@ -66,20 +66,46 @@ CRISIS_GUIDE_TEXT: str = (
 # 1인칭 위기 표현: 정보성 질의 여부와 무관하게 항상 개인 위기 호소로 간주 (안전 우선)
 # 학술 주제어("자살" 등)는 정보성 질의에서 고위험 게이트를 과발동하지 않도록 분리
 PERSONAL_DISTRESS_EXPRESSIONS: tuple[str, ...] = (
-    "죽고 싶", "사라지고 싶", "없어지고 싶", "더는 못 버티",
-    "버티기 싫", "끝내고 싶", "살기 싫", "다 그만두고 싶",
-    "사라졌으면", "안 깼으면", "이대로 끝났으면", "그만 살고 싶",
-    "눈뜨기 싫", "존재하기 싫", "내가 없어도", "다 놓고 싶", "버틸 이유가 없",
+    "죽고 싶", "죽고싶", "사라지고 싶", "사라지고싶",
+    "없어지고 싶", "없어지고싶", "더는 못 버티", "더 못 버티",
+    "버티기 싫", "끝내고 싶", "끝내고싶",
+    "살기 싫", "살기싫", "다 그만두고 싶",
+    "사라졌으면", "안 깼으면", "안깼으면",
+    "이대로 끝났으면", "그만 살고 싶", "그만살고싶",
+    "눈뜨기 싫", "눈 뜨기 싫", "존재하기 싫",
+    "내가 없어도", "다 놓고 싶", "버틸 이유가 없",
+    "살 이유가 없", "사는 이유가 없",
 )
 
-# 위 표현 + 학술·객관적 위기 주제어 (개인 호소가 아닌 설명 맥락에도 등장 가능)
-SAFETY_KEYWORDS_HIGH: tuple[str, ...] = PERSONAL_DISTRESS_EXPRESSIONS + (
-    "자살", "스스로 목숨", "극단적 선택", "생을 마감",
+# 명시적 개인 위기 표현만 HIGH로 둔다.
+# "자살" 같은 학술·객관 주제어는 단독 HIGH로 보지 않는다.
+SAFETY_KEYWORDS_HIGH: tuple[str, ...] = PERSONAL_DISTRESS_EXPRESSIONS
+
+# 학술·객관적 위기 주제어: 정보성 질의에서도 등장 가능하므로 별도 분리
+SAFETY_TOPIC_KEYWORDS: tuple[str, ...] = (
+    "자살", "자해", "스스로 목숨", "극단적 선택", "생을 마감",
+    "목숨을 끊", "죽는 법",
+)
+
+# 위기 주제어와 결합될 때 고위험으로 승격할 수 있는 실행성·임박성 신호
+SAFETY_INTENT_OR_PLAN_KEYWORDS: tuple[str, ...] = (
+    "방법", "계획", "준비", "시도", "실행",
+    "지금", "오늘", "당장", "곧",
+    "유서", "마지막", "정리하고",
+    "어떻게 하면", "어떻게 해야",
+)
+
+# 1인칭·자기지칭 신호
+FIRST_PERSON_MARKERS: tuple[str, ...] = (
+    "나", "내가", "나는", "난",
+    "저", "제가", "저는",
+    "내", "제",
 )
 
 SAFETY_KEYWORDS_MID: tuple[str, ...] = (
-    "무기력", "절망", "아무 의미 없", "다 포기하고 싶",
-    "너무 힘들어서 모르겠", "그냥 다 그만두고 싶",
+    "무기력", "절망", "아무 의미 없", "의미가 없",
+    "다 포기하고 싶", "포기하고 싶",
+    "너무 힘들어서 모르겠", "버겁다", "지쳤다", "한계다",
 )
 
 # ── 의도 분류 마커 ─────────────────────────────────────────────────────────
@@ -88,6 +114,7 @@ INFORMATIONAL_MARKERS: tuple[str, ...] = (
     "요인은", "요인과", "개념", "정의", "차이",
     "효과는", "역할", "영향을", "특성", "비교",
     "정리해", "요약", "알려주세요", "알려줘",
+    "논문", "연구", "문헌", "통계", "자료", "보고서",
 )
 
 # 실천·가이드 마커: INFORMATIONAL_MARKERS보다 우선 검사
@@ -100,7 +127,7 @@ GUIDE_MARKERS: tuple[str, ...] = (
 # classify_response_mode 전용 — GUIDE_MARKERS + 요청·해결 의도 단어
 _RESPONSE_GUIDE_MARKERS: tuple[str, ...] = (
     "어떻게", "어쩌지", "뭐라고", "추천", "도와줘",
-    "해야 해", "하면 좋을까", "해결", "조언",
+    "해야 해", "해야해", "하면 좋을까", "해결", "조언",
 ) + GUIDE_MARKERS
 
 # ── 청킹 설정 ──────────────────────────────────────────────────────────────
@@ -122,10 +149,15 @@ TEXT_ENCODING           = "utf-8"
 VECTORSTORE_CONFIG_FILE = ".config.json"
 VECTORSTORE_INDEX_FILE  = "index.faiss"
 
-DEFAULT_MIND_TEMPERATURE = 65.0
-MID_RISK_TEMPERATURE     = 47.0
-HIGH_RISK_TEMPERATURE    = 20.0
-PAUSE_AFTER_USER_TURNS   = 3
+DEFAULT_MIND_TEMPERATURE   = 65.0
+MID_RISK_TEMPERATURE       = 47.0
+HIGH_RISK_TEMPERATURE      = 20.0
+PAUSE_AFTER_USER_TURNS     = 3
+
+MAX_TEMP_INCREASE_PER_TURN = 4.0
+MAX_TEMP_DECREASE_PER_TURN = 12.0
+BASELINE_LOWER_DRIFT       = 18.0
+BASELINE_UPPER_DRIFT       = 12.0
 
 
 @dataclass(frozen=True)
@@ -223,6 +255,133 @@ class BaseRAGPipeline(ABC):
 
     def get_temperature_history(self, session_id: str) -> list[dict]:
         return self._temp_history.get(session_id, [])
+
+    def get_latest_temperature(self, session_id: str) -> float | None:
+        records = self._temp_history.get(session_id, [])
+        if not records:
+            return None
+        try:
+            return clamp_temperature(records[-1]["temperature"])
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    def _resolve_temperature_baseline(
+        self,
+        session_id: str,
+        checkin: Optional[dict[str, int]] = None,
+    ) -> float:
+        if checkin is not None:
+            return self.compute_mind_temperature(checkin)
+        latest = self.get_latest_temperature(session_id)
+        if latest is not None:
+            return latest
+        return DEFAULT_MIND_TEMPERATURE
+
+    def update_mind_temperature_from_chat(
+        self,
+        current_temp: float,
+        user_text: str,
+        risk_level: str = RISK_LOW,
+        intent: str = INTENT_PERSONAL,
+        baseline_temp: float | None = None,
+    ) -> float:
+        """LLM 호출 없이 키워드와 risk_level 기반으로 마음 온도를 결정론적으로 보정한다.
+
+        이 값은 UX 참고 지표이며 의학적 진단이 아니다.
+        정보성 질문은 사용자의 현재 상태 호소가 아니므로 마음 온도를 변화시키지 않는다.
+        단, 명시적 개인 위기 표현은 안전 우선으로 반영한다.
+        """
+        text = (user_text or "").strip()
+        text_no_space = text.replace(" ", "")
+
+        def _contains(markers: tuple[str, ...]) -> bool:
+            return any(m in text or m in text_no_space for m in markers)
+
+        negative_markers: tuple[str, ...] = (
+            "힘들", "지쳤", "무기력", "불안", "우울",
+            "버겁", "한계", "스트레스", "잠을 못",
+            "피곤", "번아웃", "괴롭",
+        )
+        strong_negative_markers: tuple[str, ...] = (
+            "죽고 싶", "죽고싶", "살기 싫", "살기싫",
+            "더는 못 버티", "더는못버티", "끝내고 싶", "끝내고싶",
+            "다 놓고 싶", "다놓고싶",
+            "버틸 이유가 없", "버틸이유가없",
+            "살 이유가 없", "살이유가없",
+        )
+        positive_markers: tuple[str, ...] = (
+            "괜찮", "나아졌", "좋아졌", "할 수 있",
+            "해볼게", "시도해볼", "쉬었", "회복",
+            "정리됐", "도움됐", "괜찮아진",
+        )
+        action_markers: tuple[str, ...] = (
+            "해볼게", "시작", "실천", "쉬어볼",
+            "정리해볼", "말해볼", "도움 요청", "도움요청",
+            "상담", "병원", "센터",
+        )
+
+        has_strong_negative = _contains(strong_negative_markers)
+
+        # 정보성 질문은 마음온도를 변화시키지 않는다.
+        # 예: "우울증과 번아웃의 차이가 뭐지?", "번아웃 정의 알려줘"
+        # 단, 명시적 개인 위기 표현은 안전 우선으로 하락 로직을 탄다.
+        if intent == INTENT_INFORMATIONAL and not has_strong_negative:
+            return clamp_temperature(current_temp)
+
+        delta = 0.0
+
+        if risk_level == RISK_HIGH:
+            delta -= 12.0
+        elif risk_level == RISK_MID:
+            delta -= 6.0
+
+        if has_strong_negative:
+            delta -= 10.0
+        elif _contains(negative_markers):
+            delta -= 3.0
+
+        if _contains(positive_markers):
+            delta += 2.0
+
+        if _contains(action_markers):
+            delta += 1.5
+
+        delta = max(
+            -MAX_TEMP_DECREASE_PER_TURN,
+            min(MAX_TEMP_INCREASE_PER_TURN, delta),
+        )
+
+        new_temp = current_temp + delta
+
+        # high 위험은 안전 우선으로 baseline 하한 제한을 적용하지 않는다.
+        if risk_level != RISK_HIGH and baseline_temp is not None:
+            new_temp = max(
+                baseline_temp - BASELINE_LOWER_DRIFT,
+                min(baseline_temp + BASELINE_UPPER_DRIFT, new_temp),
+            )
+
+        return clamp_temperature(new_temp)
+
+    def _update_session_temperature(
+        self,
+        session_id: str,
+        question: str,
+        risk_level: str,
+        intent: str,
+        checkin: Optional[dict[str, int]] = None,
+    ) -> float:
+        """baseline 계산 → current_temp 조회 → deterministic update → 기록 후 반환."""
+        baseline_temp = self._resolve_temperature_baseline(session_id, checkin)
+        current_temp  = self.get_latest_temperature(session_id) or baseline_temp
+        mind_temp = self.update_mind_temperature_from_chat(
+            current_temp=current_temp,
+            user_text=question,
+            risk_level=risk_level,
+            intent=intent,
+            baseline_temp=baseline_temp,
+        )
+        self.record_temperature(session_id, mind_temp)
+        return mind_temp
 
     # --- 인덱싱 ---
 
@@ -387,13 +546,43 @@ class BaseRAGPipeline(ABC):
 
     @staticmethod
     def compute_mind_temperature(checkin: dict[str, int]) -> float:
-        """체크인 점수(각 1~5)로 마음 온도(0~100)를 계산한다. 의학적 진단이 아님."""
-        def g(k: str) -> float:
-            return float(checkin.get(k, 3))
-        positive = g("sleep") * 0.20 + g("energy") * 0.15 + g("recovery") * 0.15 + g("mood") * 0.10
-        negative = g("stress") * 0.20 + g("fatigue") * 0.20
-        index    = (positive - negative + 1.4) / 4.0 * 100
-        return round(max(0.0, min(100.0, index)), 1)
+        """
+        체크인 점수(각 1~5)를 마음 온도(0~100)로 계산한다.
+        이 값은 의학적 진단이 아니라 현재 상태를 추정하는 UX 지표다.
+
+        가중치 설계:
+        - fatigue, energy: 번아웃의 핵심인 소진/에너지 고갈 반영
+        - stress: 만성 스트레스 축 반영
+        - recovery, sleep: 회복 가능성과 수면 상태 반영
+        - mood: 기분 상태는 보조 지표로 반영
+        """
+
+        def clamp_score(value: int) -> int:
+            return max(1, min(5, int(value)))
+
+        def positive_score(key: str) -> float:
+            # 1점 = 나쁨, 5점 = 좋음
+            value = clamp_score(checkin.get(key, 3))
+            return (value - 1) / 4
+
+        def negative_score(key: str) -> float:
+            # 1점 = 좋음, 5점 = 나쁨인 항목을 반전
+            value = clamp_score(checkin.get(key, 3))
+            return (5 - value) / 4
+
+        wellness_score = (
+            positive_score("sleep") * 0.12
+            + positive_score("energy") * 0.17
+            + positive_score("recovery") * 0.16
+            + positive_score("mood") * 0.10
+            + negative_score("stress") * 0.22
+            + negative_score("fatigue") * 0.23
+        )
+
+        # 0.0 -> 20도, 0.5 -> 60도, 1.0 -> 100도
+        temperature = 20 + wellness_score * 80
+
+        return round(max(0.0, min(100.0, temperature)), 1)
 
     def classify_risk(
         self,
@@ -541,10 +730,11 @@ class BaseRAGPipeline(ABC):
                 messages.append(AIMessage(content=ex["assistant"]))
         return messages
 
-    # --- 대화 기반 마음 온도 분석 ---
+    # --- 대화 기반 마음 온도 분석 (구 LLM 추정 방식 — 하위 호환 보존용) ---
 
     def analyze_conversation_temperature(self, query: str, messages: list) -> float:
-        """LLM이 대화 전체를 읽고 마음 온도(0~100)를 추정한다. 실패 시 키워드 휴리스틱으로 폴백."""
+        # 이전 LLM 기반 마음 온도 추정 함수.
+        # 현재 ask()/ask_llm_only()에서는 재현성과 체크인 연결성을 위해 deterministic update 로직을 사용한다.
         if not messages:
             return self._fallback_temperature(query)
 
@@ -751,9 +941,14 @@ class BaseRAGPipeline(ABC):
         profile = self._query_profile(question, checkin, session_id)
         history = self._get_session_history(session_id)
 
-        # 1: 마음 온도 — AI 답변 추가 전 사용자 중심 이력으로 분석
-        mind_temp = self.analyze_conversation_temperature(question, history.messages)
-        self.record_temperature(session_id, mind_temp)
+        # 1: 마음 온도 — 체크인 baseline + current_temp 기반 deterministic update
+        mind_temp = self._update_session_temperature(
+            session_id=session_id,
+            question=question,
+            risk_level=profile.risk_level,
+            intent=profile.intent,
+            checkin=checkin,
+        )
 
         # 2: 문맥 근거 본문 생성
         core_answer = self._generate_core_answer(question, profile, history)
@@ -794,8 +989,13 @@ class BaseRAGPipeline(ABC):
         profile = self._query_profile(question, checkin, session_id)
         history = self._get_session_history(session_id)
 
-        mind_temp = self.analyze_conversation_temperature(question, history.messages)
-        self.record_temperature(session_id, mind_temp)
+        mind_temp = self._update_session_temperature(
+            session_id=session_id,
+            question=question,
+            risk_level=profile.risk_level,
+            intent=profile.intent,
+            checkin=checkin,
+        )
 
         risk_directive = self.LLM_ONLY_RISK_DIRECTIVES.get(
             profile.risk_level, self.LLM_ONLY_RISK_DIRECTIVES[RISK_LOW]
