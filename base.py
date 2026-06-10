@@ -444,6 +444,61 @@ class BaseRAGPipeline(ABC):
     RISK_DIRECTIVES         = PROMPT_RISK_DIRECTIVES
     MODE_DIRECTIVES         = PROMPT_MODE_DIRECTIVES
 
+    # --- LLM 단독(RAG OFF) 모드 프롬프트 정책 ---
+    # BASE_SYSTEM / RISK_DIRECTIVES / MODE_DIRECTIVES 는 [참고 문서] 기반 답변을
+    # 전제하므로, RAG OFF 모드에서는 RAG 전제 표현이 없는 별도 프롬프트를 사용한다.
+
+    LLM_ONLY_SYSTEM = (
+        "당신은 번아웃과 정서 회복을 돕는 상담형 대화 도우미입니다. "
+        "[RAG OFF 모드] 현재 답변은 검색 문서, 벡터DB, retriever, context, [참고 문서]를 사용하지 않고 "
+        "LLM 자체 일반 지식과 대화 맥락만으로 작성합니다. "
+        "'참고 문서에 따르면', '자료에서 확인됩니다', '문헌에서는', '검색 결과에 따르면', "
+        "'제공된 자료에서는' 같은 RAG 근거 표현을 사용하지 마세요. "
+        "RAG를 사용한 것처럼 보이는 근거 표현도 쓰지 마세요. "
+        "의학적 진단, 치료 단정, 약물·치료 지시는 하지 말고, "
+        "자해·자살·극단적 선택·즉각적 위험 신호 대응을 항상 최우선으로 하세요. "
+        "답변은 짧고 차분하게 작성하세요. "
+        "사용자가 정보 설명을 요청하면 중립적으로 설명하고, "
+        "도움이나 방법을 요청하면 부담 없는 행동 제안을 1~3개로 제한하며, "
+        "감정 호소에는 해결책 남발보다 감정 정리와 안전한 반응을 우선하세요.\n"
+        "{mode_directive}\n{risk_directive}\n{pause_directive}"
+    )
+
+    LLM_ONLY_RISK_DIRECTIVES = {
+        RISK_HIGH: (
+            "[톤 지침] 사용자가 심리적으로 매우 지쳐 있거나 위험 신호를 보일 수 있습니다. "
+            "먼저 짧게 공감하고, 진단하거나 평가하지 마세요. "
+            "자해·자살·극단적 선택·즉각적 위험 신호가 있으면 일반 설명보다 안전 확인과 도움 요청 안내를 우선하세요. "
+            "지금 당장 부담 없이 할 수 있는 작은 행동을 1가지 정도만 제안하세요."
+        ),
+        RISK_MID: (
+            "[톤 지침] 사용자가 지쳐 있을 수 있으므로 부담 없는 표현을 쓰세요. "
+            "조언을 요청하지 않았다면 행동 제안보다 감정 정리나 맥락 확인을 우선하세요."
+        ),
+        RISK_LOW: (
+            "[톤 지침] 차분하고 자연스럽게 답하세요. "
+            "예방 가이드나 긍정적 강화는 사용자가 정보나 조언을 요청했을 때만 제공하세요."
+        ),
+    }
+
+    LLM_ONLY_MODE_DIRECTIVES = {
+        RESPONSE_MODE_EXPLORE: (
+            "[응답 모드: 탐색] 사용자가 아직 자세한 맥락을 말하지 않았습니다. "
+            "해결책을 먼저 많이 제시하지 말고, 짧게 반응하세요."
+        ),
+        RESPONSE_MODE_SUPPORT: (
+            "[응답 모드: 지지] 사용자의 감정을 해석하거나 정리하되, 바로 해결책을 남발하지 마세요."
+        ),
+        RESPONSE_MODE_GUIDE: (
+            "[응답 모드: 안내] 사용자가 조언이나 해결 방법을 요청했습니다. "
+            "일반적인 자기관리 원칙을 바탕으로 실행 가능한 제안을 1~3개로 제한하세요."
+        ),
+        RESPONSE_MODE_INFO: (
+            "[응답 모드: 정보 설명] 개념·요인·관계에 대한 설명 요청입니다. "
+            "문서 근거 표현 없이 일반 지식 수준에서 간결하고 중립적으로 설명하세요."
+        ),
+    }
+
     @classmethod
     def classify_response_mode(cls, query: str) -> str:
         q = query.strip()
@@ -467,6 +522,14 @@ class BaseRAGPipeline(ABC):
             MessagesPlaceholder(variable_name="few_shot_examples"),
             MessagesPlaceholder(variable_name="chat_history"),
             ("human", "[참고 문서]\n{context}\n\n[질문]\n{input}"),
+        ])
+
+    def build_llm_only_prompt(self) -> ChatPromptTemplate:
+        # RAG OFF 전용 프롬프트 — [참고 문서] 블록과 few-shot([참고 문서] 포함)을 넣지 않는다.
+        return ChatPromptTemplate.from_messages([
+            ("system", self.LLM_ONLY_SYSTEM),
+            MessagesPlaceholder(variable_name="chat_history"),
+            ("human", "[질문]\n{input}"),
         ])
 
     @staticmethod
@@ -715,7 +778,52 @@ class BaseRAGPipeline(ABC):
 
         # 6: 공감·면책·안전 안내 블록 조립
         answer_parts = self._compose_answer_parts(core_answer, ok, profile)
-        return self._response_dict(profile, answer_parts, mind_temp)
+        response = self._response_dict(profile, answer_parts, mind_temp)
+        response["answer_mode"] = "RAG ON"
+        response["rag_enabled"] = True
+        response["rag_answer"]  = response.get("core_answer", "")
+        return response
+
+    def ask_llm_only(
+        self,
+        question: str,
+        session_id: str = "default",
+        checkin: Optional[dict[str, int]] = None,
+    ) -> dict:
+        """RAG OFF 모드 — retriever·context·Self-RAG 검증 없이 LLM 단독으로 답변한다."""
+        profile = self._query_profile(question, checkin, session_id)
+        history = self._get_session_history(session_id)
+
+        mind_temp = self.analyze_conversation_temperature(question, history.messages)
+        self.record_temperature(session_id, mind_temp)
+
+        risk_directive = self.LLM_ONLY_RISK_DIRECTIVES.get(
+            profile.risk_level, self.LLM_ONLY_RISK_DIRECTIVES[RISK_LOW]
+        )
+        mode_directive = self.LLM_ONLY_MODE_DIRECTIVES.get(
+            profile.response_mode, self.LLM_ONLY_MODE_DIRECTIVES[RESPONSE_MODE_SUPPORT]
+        )
+
+        chain = self.build_llm_only_prompt() | self.llm | StrOutputParser()
+        core_answer = chain.invoke({
+            "input":           question,
+            "risk_directive":  risk_directive,
+            "mode_directive":  mode_directive,
+            "pause_directive": self._pause_directive(history),
+            "chat_history":    history.messages,
+        })
+
+        history.add_messages([HumanMessage(content=question), AIMessage(content=core_answer)])
+
+        # Self-RAG 검증을 수행하지 않으므로 supported=True — caveat는 비고,
+        # 고위험 개인 의도에서는 _compose_answer_parts가 safety_note를 덧붙인다.
+        answer_parts = self._compose_answer_parts(core_answer, True, profile)
+
+        response = self._response_dict(profile, answer_parts, mind_temp)
+        response["answer_mode"]     = "RAG OFF"
+        response["rag_enabled"]     = False
+        response["llm_only_answer"] = answer_parts.core_answer
+        return response
 
 
 # ===========================================================================

@@ -4,7 +4,6 @@ import streamlit as st
 
 from base import SelfRAGPipeline
 from ui.checkin_insights import init_checkin_state, render_checkin, render_checkin_sidebar
-from ui.components import render_safety_note
 from ui.layout import render_answer, render_main_header
 from ui.styles import inject_sidebar_hidden_styles, inject_styles
 from ui.theme import get_theme
@@ -33,7 +32,9 @@ if "rag" not in st.session_state:
 
 init_checkin_state()
 
-SESSION_ID = "main"
+# RAG ON/OFF 답변이 서로의 chat_history에 섞이지 않도록 세션을 분리한다.
+RAG_SESSION_ID      = "main_rag"
+LLM_ONLY_SESSION_ID = "main_llm_only"
 
 # ── 스테이지 라우팅 ───────────────────────────────────────────────────────────
 if st.session_state.stage != "chat":
@@ -48,6 +49,14 @@ else:
     # 채팅 히어로 표시 (체크인 완료 후에만)
     render_main_header(theme)
 
+    # 발표용 RAG ON/OFF 토글 — OFF면 retriever·context 없이 LLM 단독 답변
+    rag_enabled = st.toggle(
+        "RAG 사용",
+        value=True,
+        key="rag_enabled",
+    )
+    st.caption("RAG ON: 논문/문서 검색 기반 답변 · RAG OFF: LLM 단독 답변")
+
     # 채팅 히스토리 표시
     user_av = st.session_state.get("user_avatar", "🧑")
     asst_av = st.session_state.get("assistant_avatar", "🌿")
@@ -56,16 +65,7 @@ else:
         avatar = asst_av if msg["role"] == "assistant" else user_av
         with st.chat_message(msg["role"], avatar=avatar):
             if msg["role"] == "assistant":
-                st.markdown(msg["content"])
-                if msg.get("caveat"):
-                    st.markdown(
-                        f"<p style='margin:0.6rem 0 0; font-size:0.72rem;"
-                        f" color:{theme['MUTED']}; line-height:1.5;"
-                        f" font-style:italic;'>{msg['caveat']}</p>",
-                        unsafe_allow_html=True,
-                    )
-                if msg.get("safety_note"):
-                    render_safety_note(msg["safety_note"], theme)
+                render_answer(msg, theme)
             else:
                 st.markdown(msg["content"])
 
@@ -80,11 +80,22 @@ else:
         with st.chat_message("assistant", avatar=asst_av):
             with st.spinner("생각하는 중..."):
                 checkin_answers = st.session_state.answers or None
-                response = st.session_state.rag.ask(
-                    question=user_input,
-                    session_id=SESSION_ID,
-                    checkin=checkin_answers,
-                )
+                if rag_enabled:
+                    response = st.session_state.rag.ask(
+                        question=user_input,
+                        session_id=RAG_SESSION_ID,
+                        checkin=checkin_answers,
+                    )
+                    response["answer_mode"] = "RAG ON"
+                    response["rag_enabled"] = True
+                else:
+                    response = st.session_state.rag.ask_llm_only(
+                        question=user_input,
+                        session_id=LLM_ONLY_SESSION_ID,
+                        checkin=checkin_answers,
+                    )
+                    response["answer_mode"] = "RAG OFF"
+                    response["rag_enabled"] = False
 
             render_answer(response, theme)
 
@@ -96,8 +107,13 @@ else:
                 {
                     "role": "assistant",
                     "content": response.get("core_answer") or response.get("answer", ""),
+                    "core_answer": response.get("core_answer", ""),
+                    "answer_mode": response.get("answer_mode", "RAG ON" if rag_enabled else "RAG OFF"),
+                    "rag_enabled": response.get("rag_enabled", rag_enabled),
                     "caveat": response.get("caveat", ""),
                     "safety_note": response.get("safety_note", ""),
+                    "risk_level": response.get("risk_level"),
+                    "mind_temperature": response.get("mind_temperature"),
                 }
             )
 
