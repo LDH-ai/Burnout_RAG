@@ -304,6 +304,12 @@ def render_checkin_styles() -> None:
             box-shadow: 0 12px 28px rgba(112,167,123,.20) !important;
         }}
 
+        [data-testid="stFormSubmitButton"] > button[kind="primary"] {{
+            background: #4F7C5A !important;
+            border-color: #4F7C5A !important;
+            color: #fff !important;
+        }}
+
         @keyframes fadeUp {{
             from {{
                 opacity: 0;
