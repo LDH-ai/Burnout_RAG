@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import re
 import warnings
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -35,8 +34,6 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_core.chat_history import InMemoryChatMessageHistory
 
 from prompt_config import (
-    ANSWER_SECTION_CAVEAT,
-    ANSWER_SECTION_SAFETY,
     BASE_SYSTEM as PROMPT_BASE_SYSTEM,
     FEW_SHOT_EXAMPLES as PROMPT_FEW_SHOT_EXAMPLES,
     INFORMATIONAL_DIRECTIVE as PROMPT_INFORMATIONAL_DIRECTIVE,
@@ -69,81 +66,23 @@ CRISIS_GUIDE_TEXT: str = (
 # 1인칭 위기 표현: 정보성 질의 여부와 무관하게 항상 개인 위기 호소로 간주 (안전 우선)
 # 학술 주제어("자살" 등)는 정보성 질의에서 고위험 게이트를 과발동하지 않도록 분리
 PERSONAL_DISTRESS_EXPRESSIONS: tuple[str, ...] = (
-    "죽고 싶", "죽고싶", "사라지고 싶", "사라지고싶",
-    "없어지고 싶", "없어지고싶", "더는 못 버티", "더 못 버티",
-    "버티기 싫", "끝내고 싶", "끝내고싶",
-    "살기 싫", "살기싫", "다 그만두고 싶",
-    "사라졌으면", "안 깼으면", "안깼으면",
-    "이대로 끝났으면", "그만 살고 싶", "그만살고싶",
-    "눈뜨기 싫", "눈 뜨기 싫", "존재하기 싫",
-    "내가 없어도", "다 놓고 싶", "버틸 이유가 없",
-    "살 이유가 없", "사는 이유가 없",
+    "죽고 싶", "죽을까", "죽어야", "죽자",
+    "자살하고 싶",
+    "사라지고 싶", "없어지고 싶", "더는 못 버티",
+    "버티기 싫", "끝내고 싶", "살기 싫", "다 그만두고 싶",
+    "사라졌으면", "안 깼으면", "이대로 끝났으면", "그만 살고 싶",
+    "눈뜨기 싫", "존재하기 싫", "내가 없어도", "다 놓고 싶", "버틸 이유가 없",
 )
 
-# 명시적 개인 위기 표현만 HIGH로 둔다.
-# "자살" 같은 학술·객관 주제어는 단독 HIGH로 보지 않는다.
-SAFETY_KEYWORDS_HIGH: tuple[str, ...] = PERSONAL_DISTRESS_EXPRESSIONS
-
-# 학술·객관적 위기 주제어: 정보성 질의에서도 등장 가능하므로 별도 분리
-SAFETY_TOPIC_KEYWORDS: tuple[str, ...] = (
-    "자살", "자해", "스스로 목숨", "극단적 선택", "생을 마감",
-    "목숨을 끊", "죽는 법",
-)
-
-# 위기 주제어와 결합될 때 고위험으로 승격할 수 있는 실행성·임박성 신호
-SAFETY_INTENT_OR_PLAN_KEYWORDS: tuple[str, ...] = (
-    "방법", "계획", "준비", "시도", "실행",
-    "지금", "오늘", "당장", "곧",
-    "유서", "마지막", "정리하고",
-    "어떻게 하면", "어떻게 해야",
-)
-
-# 1인칭·자기지칭 신호
-FIRST_PERSON_MARKERS: tuple[str, ...] = (
-    "나", "내가", "나는", "난",
-    "저", "제가", "저는",
-    "내", "제",
+# 위 표현 + 학술·객관적 위기 주제어 (개인 호소가 아닌 설명 맥락에도 등장 가능)
+SAFETY_KEYWORDS_HIGH: tuple[str, ...] = PERSONAL_DISTRESS_EXPRESSIONS + (
+    "자살", "스스로 목숨", "극단적 선택", "생을 마감",
 )
 
 SAFETY_KEYWORDS_MID: tuple[str, ...] = (
-    "무기력", "절망", "아무 의미 없", "의미가 없",
-    "다 포기하고 싶", "포기하고 싶",
-    "너무 힘들어서 모르겠", "버겁다", "지쳤다", "한계다",
+    "무기력", "절망", "아무 의미 없", "다 포기하고 싶",
+    "너무 힘들어서 모르겠", "그냥 다 그만두고 싶",
 )
-
-# ── 답변 후처리: caveat/safety 문장 패턴 ──────────────────────────────────
-# 프롬프트가 [주의사항]/[안전 안내] 마커 출력을 지시하지만, LLM이 마커 없이
-# 본문에 유보·면책 문장을 섞는 경우를 대비한 결정론적 폴백 패턴.
-# RAGAS Answer Relevancy의 noncommittal 판정 트리거를 본문에서 제거하는 용도.
-CAVEAT_SENTENCE_PATTERNS: tuple[str, ...] = (
-    "주의할 점은", "주의하실 점은",
-    "의학적 진단이 아", "의학적 진단은 아",
-    "개인차가 있을 수", "개인에 따라 다를 수", "사람마다 다를 수",
-    "모든 개인에게 동일하게 적용되지 않",
-    "참고용으로", "참고 자료로만",
-    "전문가와 상담", "전문가의 상담", "전문가 상담이 필요", "전문가와 상의",
-    "정확한 판단은 어렵", "단정하기 어렵",
-    "일반화하는 데 한계", "일반화에는 한계", "한계가 있으며", "한계가 있습니다",
-    "후속 연구가 필요",
-)
-
-SAFETY_SENTENCE_PATTERNS: tuple[str, ...] = (
-    "자살예방 상담전화", "위기상담전화", "정신건강 위기상담",
-    "109", "1577-0199",
-)
-
-# '주의할 점은'으로 시작하는 문단이라도 실질 내용일 수 있으므로,
-# 아래 면책 패턴을 함께 포함할 때만 본문 중간에서도 caveat로 분리한다.
-CAVEAT_LEAD_INS: tuple[str, ...] = ("주의할 점", "주의하실 점")
-NONCOMMITTAL_DISCLAIMER_PATTERNS: tuple[str, ...] = (
-    "전문가", "일반화", "개인차", "한계", "참고용",
-    "후속 연구", "단정", "의학적 진단",
-)
-
-# ── 검색 설정 ──────────────────────────────────────────────────────────────
-# Context Recall 개선: Precision 1.0 대비 Recall 0.8(일부 샘플 0.33)로
-# 커버리지가 병목이므로 최종 컨텍스트 문서 수 기본값을 3 → 5로 확장.
-DEFAULT_TOP_K: int = 5
 
 # ── 의도 분류 마커 ─────────────────────────────────────────────────────────
 INFORMATIONAL_MARKERS: tuple[str, ...] = (
@@ -151,7 +90,6 @@ INFORMATIONAL_MARKERS: tuple[str, ...] = (
     "요인은", "요인과", "개념", "정의", "차이",
     "효과는", "역할", "영향을", "특성", "비교",
     "정리해", "요약", "알려주세요", "알려줘",
-    "논문", "연구", "문헌", "통계", "자료", "보고서",
 )
 
 # 실천·가이드 마커: INFORMATIONAL_MARKERS보다 우선 검사
@@ -164,7 +102,7 @@ GUIDE_MARKERS: tuple[str, ...] = (
 # classify_response_mode 전용 — GUIDE_MARKERS + 요청·해결 의도 단어
 _RESPONSE_GUIDE_MARKERS: tuple[str, ...] = (
     "어떻게", "어쩌지", "뭐라고", "추천", "도와줘",
-    "해야 해", "해야해", "하면 좋을까", "해결", "조언",
+    "해야 해", "하면 좋을까", "해결", "조언",
 ) + GUIDE_MARKERS
 
 # ── 청킹 설정 ──────────────────────────────────────────────────────────────
@@ -186,15 +124,10 @@ TEXT_ENCODING           = "utf-8"
 VECTORSTORE_CONFIG_FILE = ".config.json"
 VECTORSTORE_INDEX_FILE  = "index.faiss"
 
-DEFAULT_MIND_TEMPERATURE   = 65.0
-MID_RISK_TEMPERATURE       = 47.0
-HIGH_RISK_TEMPERATURE      = 20.0
-PAUSE_AFTER_USER_TURNS     = 3
-
-MAX_TEMP_INCREASE_PER_TURN = 4.0
-MAX_TEMP_DECREASE_PER_TURN = 12.0
-BASELINE_LOWER_DRIFT       = 18.0
-BASELINE_UPPER_DRIFT       = 12.0
+DEFAULT_MIND_TEMPERATURE = 65.0
+MID_RISK_TEMPERATURE     = 47.0
+HIGH_RISK_TEMPERATURE    = 20.0
+PAUSE_AFTER_USER_TURNS   = 3
 
 
 @dataclass(frozen=True)
@@ -292,133 +225,6 @@ class BaseRAGPipeline(ABC):
 
     def get_temperature_history(self, session_id: str) -> list[dict]:
         return self._temp_history.get(session_id, [])
-
-    def get_latest_temperature(self, session_id: str) -> float | None:
-        records = self._temp_history.get(session_id, [])
-        if not records:
-            return None
-        try:
-            return clamp_temperature(records[-1]["temperature"])
-        except (KeyError, TypeError, ValueError):
-            return None
-
-    def _resolve_temperature_baseline(
-        self,
-        session_id: str,
-        checkin: Optional[dict[str, int]] = None,
-    ) -> float:
-        if checkin is not None:
-            return self.compute_mind_temperature(checkin)
-        latest = self.get_latest_temperature(session_id)
-        if latest is not None:
-            return latest
-        return DEFAULT_MIND_TEMPERATURE
-
-    def update_mind_temperature_from_chat(
-        self,
-        current_temp: float,
-        user_text: str,
-        risk_level: str = RISK_LOW,
-        intent: str = INTENT_PERSONAL,
-        baseline_temp: float | None = None,
-    ) -> float:
-        """LLM 호출 없이 키워드와 risk_level 기반으로 마음 온도를 결정론적으로 보정한다.
-
-        이 값은 UX 참고 지표이며 의학적 진단이 아니다.
-        정보성 질문은 사용자의 현재 상태 호소가 아니므로 마음 온도를 변화시키지 않는다.
-        단, 명시적 개인 위기 표현은 안전 우선으로 반영한다.
-        """
-        text = (user_text or "").strip()
-        text_no_space = text.replace(" ", "")
-
-        def _contains(markers: tuple[str, ...]) -> bool:
-            return any(m in text or m in text_no_space for m in markers)
-
-        negative_markers: tuple[str, ...] = (
-            "힘들", "지쳤", "무기력", "불안", "우울",
-            "버겁", "한계", "스트레스", "잠을 못",
-            "피곤", "번아웃", "괴롭",
-        )
-        strong_negative_markers: tuple[str, ...] = (
-            "죽고 싶", "죽고싶", "살기 싫", "살기싫",
-            "더는 못 버티", "더는못버티", "끝내고 싶", "끝내고싶",
-            "다 놓고 싶", "다놓고싶",
-            "버틸 이유가 없", "버틸이유가없",
-            "살 이유가 없", "살이유가없",
-        )
-        positive_markers: tuple[str, ...] = (
-            "괜찮", "나아졌", "좋아졌", "할 수 있",
-            "해볼게", "시도해볼", "쉬었", "회복",
-            "정리됐", "도움됐", "괜찮아진",
-        )
-        action_markers: tuple[str, ...] = (
-            "해볼게", "시작", "실천", "쉬어볼",
-            "정리해볼", "말해볼", "도움 요청", "도움요청",
-            "상담", "병원", "센터",
-        )
-
-        has_strong_negative = _contains(strong_negative_markers)
-
-        # 정보성 질문은 마음온도를 변화시키지 않는다.
-        # 예: "우울증과 번아웃의 차이가 뭐지?", "번아웃 정의 알려줘"
-        # 단, 명시적 개인 위기 표현은 안전 우선으로 하락 로직을 탄다.
-        if intent == INTENT_INFORMATIONAL and not has_strong_negative:
-            return clamp_temperature(current_temp)
-
-        delta = 0.0
-
-        if risk_level == RISK_HIGH:
-            delta -= 12.0
-        elif risk_level == RISK_MID:
-            delta -= 6.0
-
-        if has_strong_negative:
-            delta -= 10.0
-        elif _contains(negative_markers):
-            delta -= 3.0
-
-        if _contains(positive_markers):
-            delta += 2.0
-
-        if _contains(action_markers):
-            delta += 1.5
-
-        delta = max(
-            -MAX_TEMP_DECREASE_PER_TURN,
-            min(MAX_TEMP_INCREASE_PER_TURN, delta),
-        )
-
-        new_temp = current_temp + delta
-
-        # high 위험은 안전 우선으로 baseline 하한 제한을 적용하지 않는다.
-        if risk_level != RISK_HIGH and baseline_temp is not None:
-            new_temp = max(
-                baseline_temp - BASELINE_LOWER_DRIFT,
-                min(baseline_temp + BASELINE_UPPER_DRIFT, new_temp),
-            )
-
-        return clamp_temperature(new_temp)
-
-    def _update_session_temperature(
-        self,
-        session_id: str,
-        question: str,
-        risk_level: str,
-        intent: str,
-        checkin: Optional[dict[str, int]] = None,
-    ) -> float:
-        """baseline 계산 → current_temp 조회 → deterministic update → 기록 후 반환."""
-        baseline_temp = self._resolve_temperature_baseline(session_id, checkin)
-        current_temp  = self.get_latest_temperature(session_id) or baseline_temp
-        mind_temp = self.update_mind_temperature_from_chat(
-            current_temp=current_temp,
-            user_text=question,
-            risk_level=risk_level,
-            intent=intent,
-            baseline_temp=baseline_temp,
-        )
-        self.record_temperature(session_id, mind_temp)
-        return mind_temp
 
     # --- 인덱싱 ---
 
@@ -583,43 +389,13 @@ class BaseRAGPipeline(ABC):
 
     @staticmethod
     def compute_mind_temperature(checkin: dict[str, int]) -> float:
-        """
-        체크인 점수(각 1~5)를 마음 온도(0~100)로 계산한다.
-        이 값은 의학적 진단이 아니라 현재 상태를 추정하는 UX 지표다.
-
-        가중치 설계:
-        - fatigue, energy: 번아웃의 핵심인 소진/에너지 고갈 반영
-        - stress: 만성 스트레스 축 반영
-        - recovery, sleep: 회복 가능성과 수면 상태 반영
-        - mood: 기분 상태는 보조 지표로 반영
-        """
-
-        def clamp_score(value: int) -> int:
-            return max(1, min(5, int(value)))
-
-        def positive_score(key: str) -> float:
-            # 1점 = 나쁨, 5점 = 좋음
-            value = clamp_score(checkin.get(key, 3))
-            return (value - 1) / 4
-
-        def negative_score(key: str) -> float:
-            # 1점 = 좋음, 5점 = 나쁨인 항목을 반전
-            value = clamp_score(checkin.get(key, 3))
-            return (5 - value) / 4
-
-        wellness_score = (
-            positive_score("sleep") * 0.12
-            + positive_score("energy") * 0.17
-            + positive_score("recovery") * 0.16
-            + positive_score("mood") * 0.10
-            + negative_score("stress") * 0.22
-            + negative_score("fatigue") * 0.23
-        )
-
-        # 0.0 -> 20도, 0.5 -> 60도, 1.0 -> 100도
-        temperature = 20 + wellness_score * 80
-
-        return round(max(0.0, min(100.0, temperature)), 1)
+        """체크인 점수(각 1~5)로 마음 온도(0~100)를 계산한다. 의학적 진단이 아님."""
+        def g(k: str) -> float:
+            return float(checkin.get(k, 3))
+        positive = g("sleep") * 0.20 + g("energy") * 0.15 + g("recovery") * 0.15 + g("mood") * 0.10
+        negative = g("stress") * 0.20 + g("fatigue") * 0.20
+        index    = (positive - negative + 1.4) / 4.0 * 100
+        return round(max(0.0, min(100.0, index)), 1)
 
     def classify_risk(
         self,
@@ -670,67 +446,6 @@ class BaseRAGPipeline(ABC):
     RISK_DIRECTIVES         = PROMPT_RISK_DIRECTIVES
     MODE_DIRECTIVES         = PROMPT_MODE_DIRECTIVES
 
-    # --- LLM 단독(RAG OFF) 모드 프롬프트 정책 ---
-    # BASE_SYSTEM / RISK_DIRECTIVES / MODE_DIRECTIVES 는 [참고 문서] 기반 답변을
-    # 전제하므로, RAG OFF 모드에서는 RAG 전제 표현이 없는 별도 프롬프트를 사용한다.
-
-    LLM_ONLY_SYSTEM = (
-        "당신은 번아웃과 정서 회복을 돕는 상담형 대화 도우미입니다. "
-        "[RAG OFF 모드] 현재 답변은 검색 문서, 벡터DB, retriever, context, [참고 문서]를 사용하지 않고 "
-        "LLM 자체 일반 지식과 대화 맥락만으로 작성합니다. "
-        "'참고 문서에 따르면', '자료에서 확인됩니다', '문헌에서는', '검색 결과에 따르면', "
-        "'제공된 자료에서는' 같은 RAG 근거 표현을 사용하지 마세요. "
-        "RAG를 사용한 것처럼 보이는 근거 표현도 쓰지 마세요. "
-        "의학적 진단, 치료 단정, 약물·치료 지시는 하지 말고, "
-        "자해·자살·극단적 선택·즉각적 위험 신호 대응을 항상 최우선으로 하세요. "
-        "답변은 짧고 차분하게 작성하세요. "
-        "사용자가 정보 설명을 요청하면 중립적으로 설명하고, "
-        "도움이나 방법을 요청하면 부담 없는 행동 제안을 1~3개로 제한하며, "
-        "감정 호소에는 해결책 남발보다 감정 정리와 안전한 반응을 우선하세요. "
-        "[출력 구조] 본문에는 질문에 대한 직접 답변만 작성하세요. "
-        "'의학적 진단은 아닙니다', '개인차가 있을 수 있습니다', '전문가와 상담하세요', "
-        "'참고용입니다' 같은 유보·면책 문장은 본문에 넣지 말고, 필요하면 본문 끝에 "
-        "'[주의사항]' 한 줄 아래에만 작성하세요. "
-        "자해·자살·긴급 위험 관련 상담전화·도움 요청 안내는 '[안전 안내]' 한 줄 아래에만 작성하세요. "
-        "필요 없으면 두 섹션 모두 생략하세요.\n"
-        "{mode_directive}\n{risk_directive}\n{pause_directive}"
-    )
-
-    LLM_ONLY_RISK_DIRECTIVES = {
-        RISK_HIGH: (
-            "[톤 지침] 사용자가 심리적으로 매우 지쳐 있거나 위험 신호를 보일 수 있습니다. "
-            "먼저 짧게 공감하고, 진단하거나 평가하지 마세요. "
-            "자해·자살·극단적 선택·즉각적 위험 신호가 있으면 일반 설명보다 안전 확인과 도움 요청 안내를 우선하세요. "
-            "지금 당장 부담 없이 할 수 있는 작은 행동을 1가지 정도만 제안하세요."
-        ),
-        RISK_MID: (
-            "[톤 지침] 사용자가 지쳐 있을 수 있으므로 부담 없는 표현을 쓰세요. "
-            "조언을 요청하지 않았다면 행동 제안보다 감정 정리나 맥락 확인을 우선하세요."
-        ),
-        RISK_LOW: (
-            "[톤 지침] 차분하고 자연스럽게 답하세요. "
-            "예방 가이드나 긍정적 강화는 사용자가 정보나 조언을 요청했을 때만 제공하세요."
-        ),
-    }
-
-    LLM_ONLY_MODE_DIRECTIVES = {
-        RESPONSE_MODE_EXPLORE: (
-            "[응답 모드: 탐색] 사용자가 아직 자세한 맥락을 말하지 않았습니다. "
-            "해결책을 먼저 많이 제시하지 말고, 짧게 반응하세요."
-        ),
-        RESPONSE_MODE_SUPPORT: (
-            "[응답 모드: 지지] 사용자의 감정을 해석하거나 정리하되, 바로 해결책을 남발하지 마세요."
-        ),
-        RESPONSE_MODE_GUIDE: (
-            "[응답 모드: 안내] 사용자가 조언이나 해결 방법을 요청했습니다. "
-            "일반적인 자기관리 원칙을 바탕으로 실행 가능한 제안을 1~3개로 제한하세요."
-        ),
-        RESPONSE_MODE_INFO: (
-            "[응답 모드: 정보 설명] 개념·요인·관계에 대한 설명 요청입니다. "
-            "문서 근거 표현 없이 일반 지식 수준에서 간결하고 중립적으로 설명하세요."
-        ),
-    }
-
     @classmethod
     def classify_response_mode(cls, query: str) -> str:
         q = query.strip()
@@ -756,14 +471,6 @@ class BaseRAGPipeline(ABC):
             ("human", "[참고 문서]\n{context}\n\n[질문]\n{input}"),
         ])
 
-    def build_llm_only_prompt(self) -> ChatPromptTemplate:
-        # RAG OFF 전용 프롬프트 — [참고 문서] 블록과 few-shot([참고 문서] 포함)을 넣지 않는다.
-        return ChatPromptTemplate.from_messages([
-            ("system", self.LLM_ONLY_SYSTEM),
-            MessagesPlaceholder(variable_name="chat_history"),
-            ("human", "[질문]\n{input}"),
-        ])
-
     @staticmethod
     def _build_few_shot_messages(mode: str, risk: str) -> list:
         messages = []
@@ -773,11 +480,10 @@ class BaseRAGPipeline(ABC):
                 messages.append(AIMessage(content=ex["assistant"]))
         return messages
 
-    # --- 대화 기반 마음 온도 분석 (구 LLM 추정 방식 — 하위 호환 보존용) ---
+    # --- 대화 기반 마음 온도 분석 ---
 
     def analyze_conversation_temperature(self, query: str, messages: list) -> float:
-        # 이전 LLM 기반 마음 온도 추정 함수.
-        # 현재 ask()/ask_llm_only()에서는 재현성과 체크인 연결성을 위해 deterministic update 로직을 사용한다.
+        """LLM이 대화 전체를 읽고 마음 온도(0~100)를 추정한다. 실패 시 키워드 휴리스틱으로 폴백."""
         if not messages:
             return self._fallback_temperature(query)
 
@@ -908,133 +614,30 @@ class BaseRAGPipeline(ABC):
         """기본 구현은 원본 반환. SelfRAGPipeline에서 문맥 기반 재작성으로 오버라이드."""
         return grounded_text
 
-    # --- 답변 섹션 분리 (core_answer / caveat / safety_note) ---
-
-    @staticmethod
-    def _matches_any(text: str, patterns: tuple[str, ...]) -> bool:
-        return any(p in text for p in patterns)
-
-    @classmethod
-    def _strip_caveat_sentences(cls, body: str) -> tuple[str, str, str]:
-        """마커 없이 본문에 섞인 유보·면책·안전 문장을 끝에서부터 결정론적으로 분리한다.
-
-        마지막 문단부터 문장 단위로 꼬리를 검사해 caveat/safety 패턴 문장을 이동한다.
-        문단 안에서 패턴에 걸리지 않는 문장을 만나면 그 지점에서 중단하므로
-        본문 중간은 절대 건드리지 않는다. 분리 결과 본문이 비면 원본을 유지한다.
-        """
-        paragraphs = [p.strip() for p in body.split("\n\n") if p.strip()]
-        caveat_parts: list[str] = []
-        safety_parts: list[str] = []
-
-        # 0) 위치 무관 pre-pass — '주의할 점은' 선두 + 면책 패턴('한계', '일반화',
-        #    '전문가' 등)을 동시에 충족하는 명백한 면책 문단만 본문 중간에서도 분리한다.
-        #    실질 내용을 담은 주의 문단(근거 기반 경고 등)은 본문에 남긴다.
-        kept: list[str] = []
-        for p in paragraphs:
-            is_disclaimer = (
-                any(p.startswith(lead) for lead in CAVEAT_LEAD_INS)
-                and cls._matches_any(p, NONCOMMITTAL_DISCLAIMER_PATTERNS)
-            )
-            if is_disclaimer:
-                caveat_parts.append(p)
-            else:
-                kept.append(p)
-        paragraphs = kept
-
-        while paragraphs:
-            sentences = re.split(r"(?<=[.!?])\s+", paragraphs[-1])
-            moved_caveat: list[str] = []
-            moved_safety: list[str] = []
-            while sentences:
-                tail = sentences[-1]
-                if cls._matches_any(tail, SAFETY_SENTENCE_PATTERNS):
-                    moved_safety.insert(0, sentences.pop())
-                elif cls._matches_any(tail, CAVEAT_SENTENCE_PATTERNS):
-                    moved_caveat.insert(0, sentences.pop())
-                else:
-                    break
-            if moved_safety:
-                safety_parts.insert(0, " ".join(moved_safety).strip())
-            if moved_caveat:
-                caveat_parts.insert(0, " ".join(moved_caveat).strip())
-            if sentences:  # 본문 문장이 남아 있음 — 여기서 중단
-                paragraphs[-1] = " ".join(sentences).strip()
-                break
-            paragraphs.pop()  # 문단 전체가 이동됨 — 이전 문단 계속 검사
-
-        new_body = "\n\n".join(paragraphs).strip()
-        if not new_body:  # 전부 caveat로 판정된 경우 — 본문을 비우지 않는다
-            return body.strip(), "", ""
-        return new_body, "\n\n".join(caveat_parts).strip(), "\n\n".join(safety_parts).strip()
-
-    @classmethod
-    def _split_answer_sections(cls, text: str) -> tuple[str, str, str]:
-        """LLM 출력에서 (본문, caveat, safety_note)를 분리한다.
-
-        1차: [주의사항]/[안전 안내] 마커 기준 분리 (프롬프트 지시 형식)
-        2차: 마커가 없거나 불완전하면 결정론적 문장 패턴 폴백
-        어떤 형식 오류에도 예외 없이 항상 3-tuple을 반환한다.
-        """
-        try:
-            body, caveat, safety = (text or "").strip(), "", ""
-
-            if ANSWER_SECTION_SAFETY in body:
-                body, _, safety = body.partition(ANSWER_SECTION_SAFETY)
-                body, safety = body.strip(), safety.strip()
-            if ANSWER_SECTION_CAVEAT in body:
-                body, _, caveat = body.partition(ANSWER_SECTION_CAVEAT)
-                body, caveat = body.strip(), caveat.strip()
-            # caveat 섹션 뒤에 [안전 안내]가 오는 순서도 허용
-            if not safety and ANSWER_SECTION_SAFETY in caveat:
-                caveat, _, safety = caveat.partition(ANSWER_SECTION_SAFETY)
-                caveat, safety = caveat.strip(), safety.strip()
-
-            # 폴백: 마커 없이 본문에 섞인 caveat/safety 문장 분리
-            body, extra_caveat, extra_safety = cls._strip_caveat_sentences(body)
-            caveat = "\n\n".join(p for p in (caveat, extra_caveat) if p)
-            safety = "\n\n".join(p for p in (safety, extra_safety) if p)
-
-            if not body:  # 마커만 출력된 비정상 케이스 — 원문 보존
-                return (text or "").strip(), "", ""
-            return body, caveat, safety
-        except Exception:
-            return (text or "").strip(), "", ""
-
     def _compose_answer_parts(
         self,
         core_answer: str,
         supported: bool,
         profile: QueryProfile,
-        llm_caveat: str = "",
-        llm_safety: str = "",
     ) -> AnswerParts:
-        # LLM 출력 재분리 (재작성 경로 등에서 caveat가 재유입될 수 있어 항상 수행)
-        body, parsed_caveat, parsed_safety = self._split_answer_sections(core_answer)
-
-        caveat_parts = [p for p in (llm_caveat.strip(), parsed_caveat) if p]
-        if not supported:
-            note = getattr(self, "LOW_SUPPORT_NOTE", "").strip()
-            if note and note not in caveat_parts:
-                caveat_parts.append(note)
-        caveat = "\n\n".join(dict.fromkeys(caveat_parts))  # 중복 제거, 순서 유지
-
-        safety_parts = [p for p in (llm_safety.strip(), parsed_safety) if p]
-        safety_note  = "\n\n".join(dict.fromkeys(safety_parts))
-
+        caveat      = "" if supported else getattr(self, "LOW_SUPPORT_NOTE", "").strip()
+        safety_note = ""
         is_genuine_crisis = profile.risk_level == RISK_HIGH and profile.intent == INTENT_PERSONAL
+        is_mid_crisis     = profile.risk_level == RISK_MID  and profile.intent == INTENT_PERSONAL
 
         if is_genuine_crisis:
             if not supported:
-                body   = self.SAFETY_FALLBACK
-                caveat = ""
-            # 위기 상황에서는 상담전화 안내가 반드시 포함되도록 보강
-            if CRISIS_LINE_SUICIDE not in safety_note:
-                safety_note = "\n\n".join(p for p in (safety_note, self.SAFETY_BLOCK) if p)
+                core_answer = self.SAFETY_FALLBACK
+                caveat      = ""
+            else:
+                safety_note = self.SAFETY_BLOCK
+        elif is_mid_crisis:
+            safety_note = self.SAFETY_BLOCK
 
-        parts = [p for p in (body.strip(), caveat, safety_note.strip()) if p]
+        parts = [p for p in (core_answer.strip(), caveat, safety_note.strip()) if p]
         return AnswerParts(
             answer="\n\n".join(parts),
-            core_answer=body,
+            core_answer=core_answer,
             caveat=caveat,
             safety_note=safety_note,
         )
@@ -1043,8 +646,6 @@ class BaseRAGPipeline(ABC):
     def _response_dict(profile: QueryProfile, answer_parts: AnswerParts, mind_temp: float) -> dict:
         return {
             "answer":           answer_parts.answer,
-            # RAGAS 등 평가 코드가 참조하는 응답 필드 — caveat이 섞이지 않은 core_answer만 담는다
-            "response":         answer_parts.core_answer,
             "core_answer":      answer_parts.core_answer,
             "safety_note":      answer_parts.safety_note,
             "caveat":           answer_parts.caveat,
@@ -1092,23 +693,17 @@ class BaseRAGPipeline(ABC):
         profile = self._query_profile(question, checkin, session_id)
         history = self._get_session_history(session_id)
 
-        # 1: 마음 온도 — 체크인 baseline + current_temp 기반 deterministic update
-        mind_temp = self._update_session_temperature(
-            session_id=session_id,
-            question=question,
-            risk_level=profile.risk_level,
-            intent=profile.intent,
-            checkin=checkin,
-        )
+        # 1: 마음 온도 — AI 답변 추가 전 사용자 중심 이력으로 분석
+        mind_temp = self.analyze_conversation_temperature(question, history.messages)
+        self.record_temperature(session_id, mind_temp)
 
-        # 2: 문맥 근거 본문 생성 → 섹션 분리 (본문 / caveat / 안전 안내)
-        raw_answer = self._generate_core_answer(question, profile, history)
-        core_answer, llm_caveat, llm_safety = self._split_answer_sections(raw_answer)
+        # 2: 문맥 근거 본문 생성
+        core_answer = self._generate_core_answer(question, profile, history)
 
-        # 3: 대화 이력 저장 — 마커·caveat 없는 본문만 기록 (다음 턴 문맥 오염 방지)
+        # 3: 대화 이력 저장 (마음 온도 분석 이후)
         history.add_messages([HumanMessage(content=question), AIMessage(content=core_answer)])
 
-        # 4: Self-RAG 검증 — 공감 블록·caveat 제외, 정보 블록만 검증
+        # 4: Self-RAG 검증 — 공감 블록 제외, 정보 블록만 검증
         context_docs = self._retrieve_context_docs(question)
         context_str  = self._format_docs(context_docs)
         empathy_part, verifiable_text = self._extract_verifiable_text(core_answer, profile)
@@ -1123,68 +718,9 @@ class BaseRAGPipeline(ABC):
                 core_answer = empathy_part + "\n\n" + rewritten
             ok = True
 
-        # 6: 공감·면책·안전 안내 블록 조립 (caveat/safety는 별도 필드로만 유지)
-        answer_parts = self._compose_answer_parts(
-            core_answer, ok, profile,
-            llm_caveat=llm_caveat, llm_safety=llm_safety,
-        )
-        response = self._response_dict(profile, answer_parts, mind_temp)
-        response["answer_mode"] = "RAG ON"
-        response["rag_enabled"] = True
-        response["rag_answer"]  = response.get("core_answer", "")
-        return response
-
-    def ask_llm_only(
-        self,
-        question: str,
-        session_id: str = "default",
-        checkin: Optional[dict[str, int]] = None,
-    ) -> dict:
-        """RAG OFF 모드 — retriever·context·Self-RAG 검증 없이 LLM 단독으로 답변한다."""
-        profile = self._query_profile(question, checkin, session_id)
-        history = self._get_session_history(session_id)
-
-        mind_temp = self._update_session_temperature(
-            session_id=session_id,
-            question=question,
-            risk_level=profile.risk_level,
-            intent=profile.intent,
-            checkin=checkin,
-        )
-
-        risk_directive = self.LLM_ONLY_RISK_DIRECTIVES.get(
-            profile.risk_level, self.LLM_ONLY_RISK_DIRECTIVES[RISK_LOW]
-        )
-        mode_directive = self.LLM_ONLY_MODE_DIRECTIVES.get(
-            profile.response_mode, self.LLM_ONLY_MODE_DIRECTIVES[RESPONSE_MODE_SUPPORT]
-        )
-
-        chain = self.build_llm_only_prompt() | self.llm | StrOutputParser()
-        raw_answer = chain.invoke({
-            "input":           question,
-            "risk_directive":  risk_directive,
-            "mode_directive":  mode_directive,
-            "pause_directive": self._pause_directive(history),
-            "chat_history":    history.messages,
-        })
-
-        # RAG OFF 모드에서도 본문/주의사항/안전 안내를 동일하게 분리
-        core_answer, llm_caveat, llm_safety = self._split_answer_sections(raw_answer)
-
-        history.add_messages([HumanMessage(content=question), AIMessage(content=core_answer)])
-
-        # Self-RAG 검증을 수행하지 않으므로 supported=True — caveat는 LLM 출력 분리분만,
-        # 고위험 개인 의도에서는 _compose_answer_parts가 safety_note를 보강한다.
-        answer_parts = self._compose_answer_parts(
-            core_answer, True, profile,
-            llm_caveat=llm_caveat, llm_safety=llm_safety,
-        )
-
-        response = self._response_dict(profile, answer_parts, mind_temp)
-        response["answer_mode"]     = "RAG OFF"
-        response["rag_enabled"]     = False
-        response["llm_only_answer"] = answer_parts.core_answer
-        return response
+        # 6: 공감·면책·안전 안내 블록 조립
+        answer_parts = self._compose_answer_parts(core_answer, ok, profile)
+        return self._response_dict(profile, answer_parts, mind_temp)
 
 
 # ===========================================================================
@@ -1249,31 +785,10 @@ class UtilityEval(BaseModel):
 # SelfRAGPipeline — Hybrid Search + 세션 위험도 추적 + Self-RAG 검증
 # ===========================================================================
 class SelfRAGPipeline(BaseRAGPipeline):
-    # Context Recall 개선: 최종 컨텍스트 문서 수 3 → 5 (Precision 1.0이라 확장 여유 있음)
-    TOP_K:        int   = DEFAULT_TOP_K
+    TOP_K:        int   = 3
     FETCH_K:      int   = 12
     BM25_WEIGHT:  float = 0.5
     FAISS_WEIGHT: float = 0.5
-
-    # 결정론적 query expansion (LLM 호출 없음) — 실패 시 원본 쿼리 단독으로 폴백
-    ENABLE_QUERY_EXPANSION: bool = True
-    MAX_QUERY_VARIANTS:     int  = 3
-    # rerank 임베딩 비용 상한 — 확장으로 후보가 늘어도 이 수를 넘기지 않는다
-    MAX_RERANK_CANDIDATES:  int  = 24
-
-    # 도메인 개념 확장 사전: 질문에 키가 포함되면 연관 개념어를 덧붙인 변형 쿼리 생성
-    QUERY_CONCEPT_EXPANSIONS: dict[str, str] = {
-        "번아웃":   "소진 직무 스트레스 정서적 고갈",
-        "스트레스": "스트레스 대처 회복탄력성",
-        "우울":     "우울 무망감 자살생각",
-        "자살":     "자살생각 위험 요인 보호 요인",
-        "수면":     "수면장애 불면 수면의 질",
-        "자기돌봄": "자기돌봄 마음챙김 회복",
-        "마음챙김": "마음챙김 명상 자기돌봄",
-        "완벽주의": "완벽주의 실수염려 자기비난",
-        "피로":     "피로 소진 회복",
-        "회복":     "회복탄력성 사회적 지지",
-    }
 
     HIGH_RISK_STREAK_THRESHOLD: int = 2
 
@@ -1340,6 +855,9 @@ class SelfRAGPipeline(BaseRAGPipeline):
             self._high_risk_streak[session_id] = max(0, streak - 1)
         if self._high_risk_streak[session_id] >= self.HIGH_RISK_STREAK_THRESHOLD:
             return RISK_HIGH
+        # 직전 턴에 고위험 신호가 있었으면 세션 내 위기 맥락 유지: RISK_LOW → RISK_MID 보장
+        if streak > 0 and base_risk == RISK_LOW:
+            return RISK_MID
         return base_risk
 
     # --- Hybrid 검색 (BM25 + FAISS 앙상블 + 임베딩 리랭킹) ---
@@ -1359,43 +877,6 @@ class SelfRAGPipeline(BaseRAGPipeline):
         scores  = d_norms @ q_norm
         return [docs[i] for i in np.argsort(scores)[::-1][:top_k]]
 
-    def _expand_queries(self, query: str) -> list[str]:
-        """결정론적 rule 기반 query expansion. LLM 호출 없음.
-
-        구성: ① 원문 질문 ② 핵심 키워드 중심 질문(형태소 명사 추출, kiwi 미설치 시 생략)
-        ③ 도메인 개념 확장 질문. 어떤 오류에도 최소 [원문]을 반환한다.
-        """
-        variants: list[str] = [query]
-        if not self.ENABLE_QUERY_EXPANSION:
-            return variants
-        try:
-            # ② 핵심 키워드 질문 — kiwi 명사 추출 (미설치 시 토크나이저가 str.split 폴백)
-            try:
-                from kiwipiepy import Kiwi
-                global _KIWI_INSTANCE
-                if _KIWI_INSTANCE is None:
-                    _KIWI_INSTANCE = Kiwi()
-                nouns = [
-                    t.form for t in _KIWI_INSTANCE.tokenize(query)
-                    if t.tag.startswith("NN") and len(t.form) >= 2
-                ]
-                keyword_query = " ".join(dict.fromkeys(nouns))
-                if keyword_query and keyword_query != query:
-                    variants.append(keyword_query)
-            except ImportError:
-                pass
-
-            # ③ 도메인 개념 확장 질문
-            for key, concepts in self.QUERY_CONCEPT_EXPANSIONS.items():
-                if key in query:
-                    variants.append(f"{query} {concepts}")
-                    break
-
-            # 중복 제거 + 상한
-            return list(dict.fromkeys(variants))[: self.MAX_QUERY_VARIANTS]
-        except Exception:
-            return [query]
-
     def build_retriever(self, vectorstore: FAISS) -> Runnable:
         from langchain_community.retrievers import BM25Retriever
         EnsembleRetriever = _import_ensemble_retriever()
@@ -1409,29 +890,10 @@ class SelfRAGPipeline(BaseRAGPipeline):
             retrievers=[bm25, faiss_retriever],
             weights=[self.BM25_WEIGHT, self.FAISS_WEIGHT],
         )
-        top_k          = self.TOP_K
-        max_candidates = self.MAX_RERANK_CANDIDATES
-
-        def _gather(query: str) -> list[Document]:
-            """multi-query로 후보를 모으고 중복 제거. 실패 시 원본 쿼리 단독 폴백."""
-            try:
-                seen: set[str] = set()
-                merged: list[Document] = []
-                for variant in self._expand_queries(query):
-                    for doc in ensemble.invoke(variant):
-                        key = doc.page_content
-                        if key not in seen:
-                            seen.add(key)
-                            merged.append(doc)
-                    if len(merged) >= max_candidates:
-                        break
-                return merged[:max_candidates] if merged else ensemble.invoke(query)
-            except Exception:
-                return ensemble.invoke(query)
+        top_k = self.TOP_K
 
         def _rerank(query: str) -> list[Document]:
-            docs = _gather(query)
-            # rerank는 항상 원본 질문 기준 — 확장 쿼리로 모은 후보를 원 질문 적합도로 정렬
+            docs = ensemble.invoke(query)
             return self._rerank_by_embedding_similarity(query, docs, top_k)
 
         return RunnableLambda(_rerank)
