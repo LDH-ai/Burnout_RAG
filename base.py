@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import re
 import warnings
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -35,8 +34,6 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_core.chat_history import InMemoryChatMessageHistory
 
 from prompt_config import (
-    ANSWER_SECTION_CAVEAT,
-    ANSWER_SECTION_SAFETY,
     BASE_SYSTEM as PROMPT_BASE_SYSTEM,
     FEW_SHOT_EXAMPLES as PROMPT_FEW_SHOT_EXAMPLES,
     INFORMATIONAL_DIRECTIVE as PROMPT_INFORMATIONAL_DIRECTIVE,
@@ -110,40 +107,6 @@ SAFETY_KEYWORDS_MID: tuple[str, ...] = (
     "다 포기하고 싶", "포기하고 싶",
     "너무 힘들어서 모르겠", "버겁다", "지쳤다", "한계다",
 )
-
-# ── 답변 후처리: caveat/safety 문장 패턴 ──────────────────────────────────
-# 프롬프트가 [주의사항]/[안전 안내] 마커 출력을 지시하지만, LLM이 마커 없이
-# 본문에 유보·면책 문장을 섞는 경우를 대비한 결정론적 폴백 패턴.
-# RAGAS Answer Relevancy의 noncommittal 판정 트리거를 본문에서 제거하는 용도.
-CAVEAT_SENTENCE_PATTERNS: tuple[str, ...] = (
-    "주의할 점은", "주의하실 점은",
-    "의학적 진단이 아", "의학적 진단은 아",
-    "개인차가 있을 수", "개인에 따라 다를 수", "사람마다 다를 수",
-    "모든 개인에게 동일하게 적용되지 않",
-    "참고용으로", "참고 자료로만",
-    "전문가와 상담", "전문가의 상담", "전문가 상담이 필요", "전문가와 상의",
-    "정확한 판단은 어렵", "단정하기 어렵",
-    "일반화하는 데 한계", "일반화에는 한계", "한계가 있으며", "한계가 있습니다",
-    "후속 연구가 필요",
-)
-
-SAFETY_SENTENCE_PATTERNS: tuple[str, ...] = (
-    "자살예방 상담전화", "위기상담전화", "정신건강 위기상담",
-    "109", "1577-0199",
-)
-
-# '주의할 점은'으로 시작하는 문단이라도 실질 내용일 수 있으므로,
-# 아래 면책 패턴을 함께 포함할 때만 본문 중간에서도 caveat로 분리한다.
-CAVEAT_LEAD_INS: tuple[str, ...] = ("주의할 점", "주의하실 점")
-NONCOMMITTAL_DISCLAIMER_PATTERNS: tuple[str, ...] = (
-    "전문가", "일반화", "개인차", "한계", "참고용",
-    "후속 연구", "단정", "의학적 진단",
-)
-
-# ── 검색 설정 ──────────────────────────────────────────────────────────────
-# Context Recall 개선: Precision 1.0 대비 Recall 0.8(일부 샘플 0.33)로
-# 커버리지가 병목이므로 최종 컨텍스트 문서 수 기본값을 3 → 5로 확장.
-DEFAULT_TOP_K: int = 5
 
 # ── 의도 분류 마커 ─────────────────────────────────────────────────────────
 INFORMATIONAL_MARKERS: tuple[str, ...] = (
@@ -686,13 +649,7 @@ class BaseRAGPipeline(ABC):
         "답변은 짧고 차분하게 작성하세요. "
         "사용자가 정보 설명을 요청하면 중립적으로 설명하고, "
         "도움이나 방법을 요청하면 부담 없는 행동 제안을 1~3개로 제한하며, "
-        "감정 호소에는 해결책 남발보다 감정 정리와 안전한 반응을 우선하세요. "
-        "[출력 구조] 본문에는 질문에 대한 직접 답변만 작성하세요. "
-        "'의학적 진단은 아닙니다', '개인차가 있을 수 있습니다', '전문가와 상담하세요', "
-        "'참고용입니다' 같은 유보·면책 문장은 본문에 넣지 말고, 필요하면 본문 끝에 "
-        "'[주의사항]' 한 줄 아래에만 작성하세요. "
-        "자해·자살·긴급 위험 관련 상담전화·도움 요청 안내는 '[안전 안내]' 한 줄 아래에만 작성하세요. "
-        "필요 없으면 두 섹션 모두 생략하세요.\n"
+        "감정 호소에는 해결책 남발보다 감정 정리와 안전한 반응을 우선하세요.\n"
         "{mode_directive}\n{risk_directive}\n{pause_directive}"
     )
 
@@ -908,133 +865,27 @@ class BaseRAGPipeline(ABC):
         """기본 구현은 원본 반환. SelfRAGPipeline에서 문맥 기반 재작성으로 오버라이드."""
         return grounded_text
 
-    # --- 답변 섹션 분리 (core_answer / caveat / safety_note) ---
-
-    @staticmethod
-    def _matches_any(text: str, patterns: tuple[str, ...]) -> bool:
-        return any(p in text for p in patterns)
-
-    @classmethod
-    def _strip_caveat_sentences(cls, body: str) -> tuple[str, str, str]:
-        """마커 없이 본문에 섞인 유보·면책·안전 문장을 끝에서부터 결정론적으로 분리한다.
-
-        마지막 문단부터 문장 단위로 꼬리를 검사해 caveat/safety 패턴 문장을 이동한다.
-        문단 안에서 패턴에 걸리지 않는 문장을 만나면 그 지점에서 중단하므로
-        본문 중간은 절대 건드리지 않는다. 분리 결과 본문이 비면 원본을 유지한다.
-        """
-        paragraphs = [p.strip() for p in body.split("\n\n") if p.strip()]
-        caveat_parts: list[str] = []
-        safety_parts: list[str] = []
-
-        # 0) 위치 무관 pre-pass — '주의할 점은' 선두 + 면책 패턴('한계', '일반화',
-        #    '전문가' 등)을 동시에 충족하는 명백한 면책 문단만 본문 중간에서도 분리한다.
-        #    실질 내용을 담은 주의 문단(근거 기반 경고 등)은 본문에 남긴다.
-        kept: list[str] = []
-        for p in paragraphs:
-            is_disclaimer = (
-                any(p.startswith(lead) for lead in CAVEAT_LEAD_INS)
-                and cls._matches_any(p, NONCOMMITTAL_DISCLAIMER_PATTERNS)
-            )
-            if is_disclaimer:
-                caveat_parts.append(p)
-            else:
-                kept.append(p)
-        paragraphs = kept
-
-        while paragraphs:
-            sentences = re.split(r"(?<=[.!?])\s+", paragraphs[-1])
-            moved_caveat: list[str] = []
-            moved_safety: list[str] = []
-            while sentences:
-                tail = sentences[-1]
-                if cls._matches_any(tail, SAFETY_SENTENCE_PATTERNS):
-                    moved_safety.insert(0, sentences.pop())
-                elif cls._matches_any(tail, CAVEAT_SENTENCE_PATTERNS):
-                    moved_caveat.insert(0, sentences.pop())
-                else:
-                    break
-            if moved_safety:
-                safety_parts.insert(0, " ".join(moved_safety).strip())
-            if moved_caveat:
-                caveat_parts.insert(0, " ".join(moved_caveat).strip())
-            if sentences:  # 본문 문장이 남아 있음 — 여기서 중단
-                paragraphs[-1] = " ".join(sentences).strip()
-                break
-            paragraphs.pop()  # 문단 전체가 이동됨 — 이전 문단 계속 검사
-
-        new_body = "\n\n".join(paragraphs).strip()
-        if not new_body:  # 전부 caveat로 판정된 경우 — 본문을 비우지 않는다
-            return body.strip(), "", ""
-        return new_body, "\n\n".join(caveat_parts).strip(), "\n\n".join(safety_parts).strip()
-
-    @classmethod
-    def _split_answer_sections(cls, text: str) -> tuple[str, str, str]:
-        """LLM 출력에서 (본문, caveat, safety_note)를 분리한다.
-
-        1차: [주의사항]/[안전 안내] 마커 기준 분리 (프롬프트 지시 형식)
-        2차: 마커가 없거나 불완전하면 결정론적 문장 패턴 폴백
-        어떤 형식 오류에도 예외 없이 항상 3-tuple을 반환한다.
-        """
-        try:
-            body, caveat, safety = (text or "").strip(), "", ""
-
-            if ANSWER_SECTION_SAFETY in body:
-                body, _, safety = body.partition(ANSWER_SECTION_SAFETY)
-                body, safety = body.strip(), safety.strip()
-            if ANSWER_SECTION_CAVEAT in body:
-                body, _, caveat = body.partition(ANSWER_SECTION_CAVEAT)
-                body, caveat = body.strip(), caveat.strip()
-            # caveat 섹션 뒤에 [안전 안내]가 오는 순서도 허용
-            if not safety and ANSWER_SECTION_SAFETY in caveat:
-                caveat, _, safety = caveat.partition(ANSWER_SECTION_SAFETY)
-                caveat, safety = caveat.strip(), safety.strip()
-
-            # 폴백: 마커 없이 본문에 섞인 caveat/safety 문장 분리
-            body, extra_caveat, extra_safety = cls._strip_caveat_sentences(body)
-            caveat = "\n\n".join(p for p in (caveat, extra_caveat) if p)
-            safety = "\n\n".join(p for p in (safety, extra_safety) if p)
-
-            if not body:  # 마커만 출력된 비정상 케이스 — 원문 보존
-                return (text or "").strip(), "", ""
-            return body, caveat, safety
-        except Exception:
-            return (text or "").strip(), "", ""
-
     def _compose_answer_parts(
         self,
         core_answer: str,
         supported: bool,
         profile: QueryProfile,
-        llm_caveat: str = "",
-        llm_safety: str = "",
     ) -> AnswerParts:
-        # LLM 출력 재분리 (재작성 경로 등에서 caveat가 재유입될 수 있어 항상 수행)
-        body, parsed_caveat, parsed_safety = self._split_answer_sections(core_answer)
-
-        caveat_parts = [p for p in (llm_caveat.strip(), parsed_caveat) if p]
-        if not supported:
-            note = getattr(self, "LOW_SUPPORT_NOTE", "").strip()
-            if note and note not in caveat_parts:
-                caveat_parts.append(note)
-        caveat = "\n\n".join(dict.fromkeys(caveat_parts))  # 중복 제거, 순서 유지
-
-        safety_parts = [p for p in (llm_safety.strip(), parsed_safety) if p]
-        safety_note  = "\n\n".join(dict.fromkeys(safety_parts))
-
+        caveat      = "" if supported else getattr(self, "LOW_SUPPORT_NOTE", "").strip()
+        safety_note = ""
         is_genuine_crisis = profile.risk_level == RISK_HIGH and profile.intent == INTENT_PERSONAL
 
         if is_genuine_crisis:
             if not supported:
-                body   = self.SAFETY_FALLBACK
-                caveat = ""
-            # 위기 상황에서는 상담전화 안내가 반드시 포함되도록 보강
-            if CRISIS_LINE_SUICIDE not in safety_note:
-                safety_note = "\n\n".join(p for p in (safety_note, self.SAFETY_BLOCK) if p)
+                core_answer = self.SAFETY_FALLBACK
+                caveat      = ""
+            else:
+                safety_note = self.SAFETY_BLOCK
 
-        parts = [p for p in (body.strip(), caveat, safety_note.strip()) if p]
+        parts = [p for p in (core_answer.strip(), caveat, safety_note.strip()) if p]
         return AnswerParts(
             answer="\n\n".join(parts),
-            core_answer=body,
+            core_answer=core_answer,
             caveat=caveat,
             safety_note=safety_note,
         )
@@ -1043,8 +894,6 @@ class BaseRAGPipeline(ABC):
     def _response_dict(profile: QueryProfile, answer_parts: AnswerParts, mind_temp: float) -> dict:
         return {
             "answer":           answer_parts.answer,
-            # RAGAS 등 평가 코드가 참조하는 응답 필드 — caveat이 섞이지 않은 core_answer만 담는다
-            "response":         answer_parts.core_answer,
             "core_answer":      answer_parts.core_answer,
             "safety_note":      answer_parts.safety_note,
             "caveat":           answer_parts.caveat,
@@ -1101,14 +950,13 @@ class BaseRAGPipeline(ABC):
             checkin=checkin,
         )
 
-        # 2: 문맥 근거 본문 생성 → 섹션 분리 (본문 / caveat / 안전 안내)
-        raw_answer = self._generate_core_answer(question, profile, history)
-        core_answer, llm_caveat, llm_safety = self._split_answer_sections(raw_answer)
+        # 2: 문맥 근거 본문 생성
+        core_answer = self._generate_core_answer(question, profile, history)
 
-        # 3: 대화 이력 저장 — 마커·caveat 없는 본문만 기록 (다음 턴 문맥 오염 방지)
+        # 3: 대화 이력 저장 (마음 온도 분석 이후)
         history.add_messages([HumanMessage(content=question), AIMessage(content=core_answer)])
 
-        # 4: Self-RAG 검증 — 공감 블록·caveat 제외, 정보 블록만 검증
+        # 4: Self-RAG 검증 — 공감 블록 제외, 정보 블록만 검증
         context_docs = self._retrieve_context_docs(question)
         context_str  = self._format_docs(context_docs)
         empathy_part, verifiable_text = self._extract_verifiable_text(core_answer, profile)
@@ -1123,11 +971,8 @@ class BaseRAGPipeline(ABC):
                 core_answer = empathy_part + "\n\n" + rewritten
             ok = True
 
-        # 6: 공감·면책·안전 안내 블록 조립 (caveat/safety는 별도 필드로만 유지)
-        answer_parts = self._compose_answer_parts(
-            core_answer, ok, profile,
-            llm_caveat=llm_caveat, llm_safety=llm_safety,
-        )
+        # 6: 공감·면책·안전 안내 블록 조립
+        answer_parts = self._compose_answer_parts(core_answer, ok, profile)
         response = self._response_dict(profile, answer_parts, mind_temp)
         response["answer_mode"] = "RAG ON"
         response["rag_enabled"] = True
@@ -1160,7 +1005,7 @@ class BaseRAGPipeline(ABC):
         )
 
         chain = self.build_llm_only_prompt() | self.llm | StrOutputParser()
-        raw_answer = chain.invoke({
+        core_answer = chain.invoke({
             "input":           question,
             "risk_directive":  risk_directive,
             "mode_directive":  mode_directive,
@@ -1168,17 +1013,11 @@ class BaseRAGPipeline(ABC):
             "chat_history":    history.messages,
         })
 
-        # RAG OFF 모드에서도 본문/주의사항/안전 안내를 동일하게 분리
-        core_answer, llm_caveat, llm_safety = self._split_answer_sections(raw_answer)
-
         history.add_messages([HumanMessage(content=question), AIMessage(content=core_answer)])
 
-        # Self-RAG 검증을 수행하지 않으므로 supported=True — caveat는 LLM 출력 분리분만,
-        # 고위험 개인 의도에서는 _compose_answer_parts가 safety_note를 보강한다.
-        answer_parts = self._compose_answer_parts(
-            core_answer, True, profile,
-            llm_caveat=llm_caveat, llm_safety=llm_safety,
-        )
+        # Self-RAG 검증을 수행하지 않으므로 supported=True — caveat는 비고,
+        # 고위험 개인 의도에서는 _compose_answer_parts가 safety_note를 덧붙인다.
+        answer_parts = self._compose_answer_parts(core_answer, True, profile)
 
         response = self._response_dict(profile, answer_parts, mind_temp)
         response["answer_mode"]     = "RAG OFF"
@@ -1249,31 +1088,10 @@ class UtilityEval(BaseModel):
 # SelfRAGPipeline — Hybrid Search + 세션 위험도 추적 + Self-RAG 검증
 # ===========================================================================
 class SelfRAGPipeline(BaseRAGPipeline):
-    # Context Recall 개선: 최종 컨텍스트 문서 수 3 → 5 (Precision 1.0이라 확장 여유 있음)
-    TOP_K:        int   = DEFAULT_TOP_K
+    TOP_K:        int   = 3
     FETCH_K:      int   = 12
     BM25_WEIGHT:  float = 0.5
     FAISS_WEIGHT: float = 0.5
-
-    # 결정론적 query expansion (LLM 호출 없음) — 실패 시 원본 쿼리 단독으로 폴백
-    ENABLE_QUERY_EXPANSION: bool = True
-    MAX_QUERY_VARIANTS:     int  = 3
-    # rerank 임베딩 비용 상한 — 확장으로 후보가 늘어도 이 수를 넘기지 않는다
-    MAX_RERANK_CANDIDATES:  int  = 24
-
-    # 도메인 개념 확장 사전: 질문에 키가 포함되면 연관 개념어를 덧붙인 변형 쿼리 생성
-    QUERY_CONCEPT_EXPANSIONS: dict[str, str] = {
-        "번아웃":   "소진 직무 스트레스 정서적 고갈",
-        "스트레스": "스트레스 대처 회복탄력성",
-        "우울":     "우울 무망감 자살생각",
-        "자살":     "자살생각 위험 요인 보호 요인",
-        "수면":     "수면장애 불면 수면의 질",
-        "자기돌봄": "자기돌봄 마음챙김 회복",
-        "마음챙김": "마음챙김 명상 자기돌봄",
-        "완벽주의": "완벽주의 실수염려 자기비난",
-        "피로":     "피로 소진 회복",
-        "회복":     "회복탄력성 사회적 지지",
-    }
 
     HIGH_RISK_STREAK_THRESHOLD: int = 2
 
@@ -1359,43 +1177,6 @@ class SelfRAGPipeline(BaseRAGPipeline):
         scores  = d_norms @ q_norm
         return [docs[i] for i in np.argsort(scores)[::-1][:top_k]]
 
-    def _expand_queries(self, query: str) -> list[str]:
-        """결정론적 rule 기반 query expansion. LLM 호출 없음.
-
-        구성: ① 원문 질문 ② 핵심 키워드 중심 질문(형태소 명사 추출, kiwi 미설치 시 생략)
-        ③ 도메인 개념 확장 질문. 어떤 오류에도 최소 [원문]을 반환한다.
-        """
-        variants: list[str] = [query]
-        if not self.ENABLE_QUERY_EXPANSION:
-            return variants
-        try:
-            # ② 핵심 키워드 질문 — kiwi 명사 추출 (미설치 시 토크나이저가 str.split 폴백)
-            try:
-                from kiwipiepy import Kiwi
-                global _KIWI_INSTANCE
-                if _KIWI_INSTANCE is None:
-                    _KIWI_INSTANCE = Kiwi()
-                nouns = [
-                    t.form for t in _KIWI_INSTANCE.tokenize(query)
-                    if t.tag.startswith("NN") and len(t.form) >= 2
-                ]
-                keyword_query = " ".join(dict.fromkeys(nouns))
-                if keyword_query and keyword_query != query:
-                    variants.append(keyword_query)
-            except ImportError:
-                pass
-
-            # ③ 도메인 개념 확장 질문
-            for key, concepts in self.QUERY_CONCEPT_EXPANSIONS.items():
-                if key in query:
-                    variants.append(f"{query} {concepts}")
-                    break
-
-            # 중복 제거 + 상한
-            return list(dict.fromkeys(variants))[: self.MAX_QUERY_VARIANTS]
-        except Exception:
-            return [query]
-
     def build_retriever(self, vectorstore: FAISS) -> Runnable:
         from langchain_community.retrievers import BM25Retriever
         EnsembleRetriever = _import_ensemble_retriever()
@@ -1409,29 +1190,10 @@ class SelfRAGPipeline(BaseRAGPipeline):
             retrievers=[bm25, faiss_retriever],
             weights=[self.BM25_WEIGHT, self.FAISS_WEIGHT],
         )
-        top_k          = self.TOP_K
-        max_candidates = self.MAX_RERANK_CANDIDATES
-
-        def _gather(query: str) -> list[Document]:
-            """multi-query로 후보를 모으고 중복 제거. 실패 시 원본 쿼리 단독 폴백."""
-            try:
-                seen: set[str] = set()
-                merged: list[Document] = []
-                for variant in self._expand_queries(query):
-                    for doc in ensemble.invoke(variant):
-                        key = doc.page_content
-                        if key not in seen:
-                            seen.add(key)
-                            merged.append(doc)
-                    if len(merged) >= max_candidates:
-                        break
-                return merged[:max_candidates] if merged else ensemble.invoke(query)
-            except Exception:
-                return ensemble.invoke(query)
+        top_k = self.TOP_K
 
         def _rerank(query: str) -> list[Document]:
-            docs = _gather(query)
-            # rerank는 항상 원본 질문 기준 — 확장 쿼리로 모은 후보를 원 질문 적합도로 정렬
+            docs = ensemble.invoke(query)
             return self._rerank_by_embedding_similarity(query, docs, top_k)
 
         return RunnableLambda(_rerank)
